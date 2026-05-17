@@ -1,8 +1,3 @@
-"""
-Polymarket Weather Checker — Streamlit version
-Forecasts: ECMWF IFS + GFS-GraphCast + GFS  vs  Polymarket temperature markets
-Current conditions: Open-Meteo live data (temp, wind, humidity + timestamp)
-"""
 import os
 import re
 import json
@@ -959,7 +954,7 @@ def extract_resolution_station(description: str) -> dict | None:
 
     # Station name in prose: "recorded at the Buckley Space Force Base Station"
     name_m = re.search(
-        r'recorded at(?: the)? ([A-Z][\w\s\-\.\']+(?)(?:\s+[Ss]tation|\s+in degrees)',
+        r'recorded at(?: the)? ([A-Z][\w\s\-\.\'+?](?:\s+[Ss]tation|\s+in degrees)',
         description)
     station_name = name_m.group(1).strip() if name_m else ""
 
