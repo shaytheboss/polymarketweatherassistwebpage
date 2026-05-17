@@ -64,6 +64,38 @@ def dynamic_sigma(days_ahead: int) -> float:
     if days_ahead <= 7: return 2.5
     return 3.5
 
+
+# Model reliability weights — used in weighted-consensus probability
+MODEL_WEIGHTS = {
+    "NWS":           1.3,   # HRRR-based, hyperlocal US, best ≤3d
+    "ECMWF IFS":     1.2,   # European physics model, globally best 3-10d
+    "GFS-GraphCast": 1.1,   # Google DeepMind AI, strong 5-10d
+    "ECMWF AIFS":    1.1,   # ECMWF AI fallback
+    "GFS":           1.0,
+    "Tomorrow.io":   1.0,
+    "Meteosource":   1.0,
+}
+
+def _model_weight(label: str) -> float:
+    for k, w in MODEL_WEIGHTS.items():
+        if k.lower() in label.lower():
+            return w
+    return 1.0
+
+
+def kelly_fraction(p_model: float, yes_price: float) -> tuple[float, str]:
+    """Quarter-Kelly fraction and which side to bet on a binary prediction market."""
+    if p_model > yes_price and (1 - yes_price) > 0:
+        full_kelly = (p_model - yes_price) / (1 - yes_price)
+        return full_kelly / 4, "YES"
+    p_no     = 1 - p_model
+    no_price = 1 - yes_price
+    if no_price > 0 and p_no > no_price:
+        full_kelly = (p_no - no_price) / (1 - no_price)
+        return max(0.0, full_kelly) / 4, "NO"
+    return 0.0, "—"
+
+
 # ── Polymarket Weather Stations (METAR ASOS) ──────────────────────────────────
 # Polymarket weather markets resolve via specific airport METAR stations.
 # Forecasts and current observations MUST be from these exact stations.
@@ -1098,13 +1130,23 @@ def enrich_markets(markets: list, model_results: list,
                         p = empirical_bucket_prob(
                             info["members"], bucket.get("min_c"), bucket.get("max_c"))
                         if p is not None:
-                            per_model.append((label, p))
+                            per_model.append({
+                                "label": label, "prob": p,
+                                "weight": _model_weight(label),
+                                "forecast_c": None, "forecast_f": None,
+                            })
         elif det_max:
-            probs      = [bucket_probability_sigma(fc, bucket.get("min_c"), bucket.get("max_c"), sigma)
-                          for fc in det_max]
-            model_prob = sum(probs) / len(probs)
-            method     = f"normal approx (σ={sigma:.1f}°C, {len(det_max)} sources)"
-            per_model  = list(zip([r["label"] for r in valid_det], probs))
+            probs    = [bucket_probability_sigma(fc, bucket.get("min_c"), bucket.get("max_c"), sigma)
+                        for fc in det_max]
+            weights  = [_model_weight(r["label"]) for r in valid_det]
+            wsum     = sum(p * w for p, w in zip(probs, weights))
+            model_prob = wsum / sum(weights)
+            method   = f"weighted avg (σ={sigma:.1f}°C, {len(det_max)} sources)"
+            per_model = [
+                {"label": r["label"], "prob": p, "weight": w,
+                 "forecast_c": r.get("max_c"), "forecast_f": r.get("max_f")}
+                for r, p, w in zip(valid_det, probs, weights)
+            ]
         else:
             enriched.append({**m, "model_prob": None, "edge": None,
                              "per_model": [], "method": "no-data"})
@@ -1559,13 +1601,288 @@ def render_markets(markets: list):
             if m.get("bucket"):
                 st.caption(f"Temperature bucket: {fmt_bucket(m['bucket'])}")
             if m.get("per_model"):
-                per = "  ·  ".join(f"{lbl}: {p*100:.1f}%" for lbl, p in m["per_model"])
-                st.caption(f"Per model: {per}")
+                pm_rows = []
+                for pm in m["per_model"]:
+                    lbl = pm["label"] if isinstance(pm, dict) else pm[0]
+                    p   = pm["prob"]  if isinstance(pm, dict) else pm[1]
+                    fc  = pm.get("forecast_c") if isinstance(pm, dict) else None
+                    w   = pm.get("weight", 1.0) if isinstance(pm, dict) else 1.0
+                    stars = "★★★" if w >= 1.2 else "★★" if w >= 1.1 else "★"
+                    pm_rows.append({
+                        "Model": lbl,
+                        "Forecast High": (f"{fc:.1f}°C / {fc*9/5+32:.1f}°F" if fc else "—"),
+                        "P(YES)": f"{p*100:.1f}%",
+                        "Reliability": stars,
+                    })
+                if pm_rows:
+                    st.dataframe(pd.DataFrame(pm_rows).set_index("Model"),
+                                 use_container_width=True)
             if m.get("method"):
                 st.caption(f"Probability method: {m['method']}")
 
             if m.get("url"):
                 st.link_button("Open on Polymarket ↗", m["url"])
+
+# ── Recommendation engine ─────────────────────────────────────────────────────
+
+def render_detailed_recommendation(enriched_markets: list, days_ahead: int, sigma: float):
+    """
+    Full plain-language recommendation for each market — model breakdown,
+    consensus analysis, narrative, risk factors, position sizing.
+    """
+    actionable = [m for m in enriched_markets
+                  if m.get("model_prob") is not None and m.get("yes_price") is not None]
+    if not actionable:
+        return
+
+    st.markdown("---")
+    st.markdown("## 🎯 Trading Recommendations")
+    st.caption(
+        "Per-market analysis: model breakdown · agreement · plain-language verdict · suggested position size. "
+        "Sorted by |edge|."
+    )
+
+    actionable = sorted(actionable, key=lambda m: abs(m.get("edge") or 0), reverse=True)
+
+    # Confidence label from days ahead
+    if days_ahead <= 1:    conf_label, conf_icon = "VERY HIGH", "✅✅"
+    elif days_ahead <= 3:  conf_label, conf_icon = "HIGH",      "✅"
+    elif days_ahead <= 7:  conf_label, conf_icon = "MODERATE",  "⚠️"
+    elif days_ahead <= 14: conf_label, conf_icon = "LOW",       "⚠️⚠️"
+    else:                  conf_label, conf_icon = "VERY LOW",  "❌"
+
+    for m in actionable:
+        yes_p     = m["yes_price"]
+        no_p      = m.get("no_price", round(1 - yes_p, 4))
+        mprob     = m["model_prob"]
+        edge      = m["edge"]
+        per_model = m.get("per_model", [])
+        question  = m["question"]
+        bucket    = m.get("bucket")
+        edge_pp   = edge * 100
+
+        # ── Verdict ─────────────────────────────────────────────────────────
+        if   edge_pp >= 15:  verdict = "🟢 STRONG BUY YES"
+        elif edge_pp >= 8:   verdict = "🟡 BUY YES"
+        elif edge_pp >= 4:   verdict = "💛 Slight lean YES"
+        elif edge_pp <= -15: verdict = "🔴 STRONG BUY NO"
+        elif edge_pp <= -8:  verdict = "🟠 BUY NO"
+        elif edge_pp <= -4:  verdict = "🟠 Slight lean NO"
+        else:                verdict = "⚪ No clear edge"
+
+        # ── Model agreement ──────────────────────────────────────────────────
+        valid_pm = [pm for pm in per_model if isinstance(pm, dict) and pm.get("forecast_c") is not None]
+        fc_values = [pm["forecast_c"] for pm in valid_pm]
+        probs_list = [pm["prob"] for pm in per_model if isinstance(pm, dict) and pm.get("prob") is not None]
+
+        if len(fc_values) >= 2:
+            spread_c = max(fc_values) - min(fc_values)
+            spread_f = spread_c * 9 / 5
+            mean_fc  = sum(fc_values) / len(fc_values)
+            if spread_c <= 1.0:
+                agree_icon  = "✅"
+                agree_label = f"STRONG CONSENSUS — all models within {spread_f:.1f}°F of each other"
+            elif spread_c <= 2.0:
+                agree_icon  = "✅"
+                agree_label = f"GOOD CONSENSUS — spread of {spread_f:.1f}°F"
+            elif spread_c <= 3.0:
+                agree_icon  = "⚠️"
+                agree_label = f"SOME DISAGREEMENT — spread of {spread_f:.1f}°F"
+            else:
+                agree_icon  = "❌"
+                agree_label = f"SIGNIFICANT DISAGREEMENT — spread of {spread_f:.1f}°F (reduce position)"
+        else:
+            spread_c   = None
+            spread_f   = None
+            mean_fc    = None
+            agree_icon = "⚠️"
+            agree_label = "Limited deterministic model data (ensemble-only)"
+
+        # Find outlier models (>10pp from mean probability)
+        outlier_labels = []
+        if len(probs_list) >= 3:
+            mean_p = sum(probs_list) / len(probs_list)
+            for pm in per_model:
+                if isinstance(pm, dict) and abs((pm.get("prob") or mean_p) - mean_p) > 0.10:
+                    outlier_labels.append(pm["label"])
+
+        # ── Kelly sizing ────────────────────────────────────────────────────
+        qk, bet_side = kelly_fraction(mprob, yes_p)
+        capped       = min(qk, 0.05)
+
+        # ── Bucket description ───────────────────────────────────────────────
+        bucket_desc = fmt_bucket(bucket) if bucket else "the target temperature range"
+
+        # ── Narrative paragraphs ─────────────────────────────────────────────
+        narrative = []
+
+        # Lead
+        if edge_pp >= 8:
+            narrative.append(
+                f"The combined model forecast gives a **{mprob*100:.1f}% probability** "
+                f"that the temperature will land in {bucket_desc}, "
+                f"while the market is only pricing it at **{yes_p*100:.0f}¢**. "
+                f"That's a **{edge_pp:.1f} percentage-point gap** — large enough to be a real edge."
+            )
+        elif edge_pp <= -8:
+            narrative.append(
+                f"The models give only **{mprob*100:.1f}%** probability "
+                f"that the temperature will land in {bucket_desc}, "
+                f"but the market prices YES at **{yes_p*100:.0f}¢**. "
+                f"NO shares are undervalued by **{abs(edge_pp):.1f}pp**."
+            )
+        else:
+            narrative.append(
+                f"Models say **{mprob*100:.1f}%** vs market at **{yes_p*100:.0f}¢** — "
+                f"a gap of only {edge_pp:+.1f}pp. This is within the noise margin; no strong edge."
+            )
+
+        # Consensus
+        n_models = len([pm for pm in per_model if isinstance(pm, dict)])
+        if spread_c is not None:
+            if spread_c <= 1.0:
+                narrative.append(
+                    f"All {n_models} models show **tight agreement** (forecasts only {spread_f:.1f}°F apart). "
+                    f"This is a strong confirmation signal."
+                )
+            elif spread_c >= 3.0:
+                out_str = f" **{', '.join(outlier_labels)}** diverges most from the group." if outlier_labels else ""
+                narrative.append(
+                    f"⚠️ **The models disagree significantly** ({spread_f:.1f}°F spread).{out_str} "
+                    f"This adds real uncertainty — consider a smaller position."
+                )
+            elif outlier_labels:
+                narrative.append(
+                    f"Most models agree, but **{', '.join(outlier_labels)}** is the outlier. "
+                    f"If that model has a strong track record in this region, weigh it carefully."
+                )
+
+        # Days-ahead context
+        if days_ahead <= 1:
+            narrative.append(
+                f"With **{days_ahead} day{'s' if days_ahead != 1 else ''} until resolution**, "
+                f"the forecast is essentially locked in — historical error at this range is ±2–3°F."
+            )
+        elif days_ahead <= 3:
+            narrative.append(
+                f"At **{days_ahead} days out**, NWS (HRRR model) is extremely reliable for US cities. "
+                f"ECMWF also performs well at this range. σ = {sigma:.1f}°C used in probability."
+            )
+        elif days_ahead <= 7:
+            narrative.append(
+                f"At **{days_ahead} days out**, ECMWF IFS and GFS-GraphCast are the most reliable sources. "
+                f"Forecast accuracy is good but not perfect — σ = {sigma:.1f}°C."
+            )
+        else:
+            narrative.append(
+                f"At **{days_ahead} days out**, uncertainty is elevated (σ = {sigma:.1f}°C used). "
+                f"Only bet if the edge is very large and models strongly agree."
+            )
+
+        # ── Render ──────────────────────────────────────────────────────────
+        with st.container(border=True):
+            st.markdown(f"### {verdict}")
+            st.markdown(f"**{question}**")
+
+            # Key metrics
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Market YES price", f"{yes_p*100:.0f}¢",
+                      help="What you pay for 1 YES share that pays $1 if resolved YES")
+            c2.metric("Models say P(YES)", f"{mprob*100:.1f}%",
+                      delta=f"{edge_pp:+.1f}pp edge",
+                      delta_color="normal" if edge_pp >= 0 else "inverse")
+            c3.metric(f"Forecast confidence", f"{conf_label}",
+                      delta=f"{days_ahead}d to resolution",
+                      delta_color="off")
+            c4.metric("Suggested position", f"{capped*100:.1f}% of bankroll",
+                      delta=f"¼-Kelly (full: {qk*4*100:.0f}%)",
+                      delta_color="off")
+
+            # Per-model breakdown table
+            if per_model:
+                st.markdown("**📊 Model breakdown:**")
+
+                role_map = {
+                    "nws":        "US local (HRRR-based) — best for US ≤3d",
+                    "ecmwf ifs":  "European physics — globally best 3-10d",
+                    "graphcast":  "AI model (Google DeepMind) — strong 5-10d",
+                    "ecmwf aifs": "AI model (ECMWF) — strong at medium range",
+                    "gfs":        "NOAA physics model — solid global baseline",
+                    "tomorrow":   "Commercial aggregator",
+                    "meteosource":"Commercial aggregator",
+                }
+
+                pm_rows = []
+                for pm in per_model:
+                    if not isinstance(pm, dict):
+                        continue
+                    lbl    = pm["label"]
+                    p      = pm["prob"]
+                    fc     = pm.get("forecast_c")
+                    w      = pm.get("weight", 1.0)
+                    stars  = "★★★" if w >= 1.2 else "★★" if w >= 1.1 else "★"
+                    role   = next((v for k, v in role_map.items() if k in lbl.lower()), "")
+                    marker = " ⚠" if lbl in outlier_labels else ""
+                    pm_rows.append({
+                        "Model":          lbl + marker,
+                        "Forecast High":  (f"{fc:.1f}°C  /  {fc*9/5+32:.1f}°F" if fc is not None else "—"),
+                        "P(YES)":         f"{p*100:.1f}%",
+                        "Reliability":    stars,
+                        "Best for":       role,
+                    })
+
+                st.dataframe(pd.DataFrame(pm_rows).set_index("Model"),
+                             use_container_width=True)
+                st.caption(f"{agree_icon} Model agreement: **{agree_label}**")
+
+            # Analysis narrative
+            st.markdown("**📝 Analysis:**")
+            for part in narrative:
+                st.markdown(f"- {part}")
+
+            # Risk factors
+            st.markdown("**⚡ Risk factors:**")
+            risks = []
+            if days_ahead <= 2:    risks.append("✅ Short horizon — forecast is highly reliable")
+            elif days_ahead <= 5:  risks.append("✅ Medium horizon — generally reliable")
+            else:                  risks.append("⚠️ Long horizon — elevated uncertainty, consider waiting")
+
+            if spread_c is not None and spread_c <= 1.0:
+                risks.append("✅ Models strongly agree — high conviction signal")
+            elif spread_c is not None and spread_c >= 3.0:
+                risks.append("❌ Models disagree significantly — reduce position size")
+
+            res = m.get("resolution") or {}
+            if res.get("icao"):
+                risks.append(f"✅ Resolution station detected: `{res['icao']}` — forecast is targeted at the right location")
+            else:
+                risks.append("⚠️ No resolution station detected — Polymarket may use a different point than our forecast")
+
+            for r in risks:
+                st.markdown(f"- {r}")
+
+            # Position sizing guidance
+            st.markdown("**💰 Position sizing:**")
+            if qk > 0 and abs(edge_pp) >= 8:
+                on_1000 = capped * 1000
+                on_bankroll_str = f"On a $1,000 bankroll → invest ~**${on_1000:.0f}** in {bet_side} shares"
+                st.markdown(
+                    f"Buy **{bet_side}** &nbsp;·&nbsp; "
+                    f"Full Kelly = {qk*4*100:.1f}% (too aggressive for real money)  &nbsp;·&nbsp; "
+                    f"**¼-Kelly = {qk*100:.1f}%**, capped at **{capped*100:.1f}%**  \n"
+                    f"{on_bankroll_str}"
+                )
+            elif abs(edge_pp) < 4:
+                st.markdown("Edge is too thin to justify a position. **Pass on this market** or paper-trade.")
+            else:
+                st.markdown(
+                    f"Edge exists ({edge_pp:+.1f}pp) but is in the 4–8pp zone — "
+                    f"consider a small position (**max 2% of bankroll**) or wait for the forecast to sharpen closer to resolution."
+                )
+
+            if m.get("url"):
+                st.link_button("Open on Polymarket ↗", m["url"])
+
 
 # ── Main analysis flow ────────────────────────────────────────────────────────
 
@@ -1729,6 +2046,7 @@ def run_analysis(city_input: str, date_str: str, markets_override=None):
     valid_extra  = [s for s in additional_sources if s.get("max_c") is not None and not s.get("error")]
     enriched = enrich_markets(markets, model_results, dist_members, by_model, valid_extra, sigma)
     render_markets(enriched)
+    render_detailed_recommendation(enriched, days_ahead, sigma)
     return model_results
 
 # ── Discover-all flow ─────────────────────────────────────────────────────────
