@@ -57,6 +57,18 @@ AVWX_METAR   = "https://aviationweather.gov/api/data/metar"
 AVWX_STATION = "https://aviationweather.gov/api/data/stationinfo"
 SIGMA        = 2.5   # °C day-ahead forecast uncertainty (fallback only)
 
+NWS_API         = "https://api.weather.gov"
+TOMORROW_API    = "https://api.tomorrow.io/v4/weather/forecast"
+METEOSOURCE_API = "https://www.meteosource.com/api/v1/free/point"
+
+
+def dynamic_sigma(days_ahead: int) -> float:
+    """Forecast uncertainty grows with horizon."""
+    if days_ahead <= 1: return 1.2
+    if days_ahead <= 3: return 1.8
+    if days_ahead <= 7: return 2.5
+    return 3.5
+
 # ── Polymarket Weather Stations (METAR ASOS) ──────────────────────────────────
 # Polymarket weather markets resolve via specific airport METAR stations.
 # Forecasts and current observations MUST be from these exact stations.
@@ -217,6 +229,12 @@ def normal_cdf(x: float, mu: float, sigma: float) -> float:
 def bucket_probability(forecast_c, min_c, max_c) -> float:
     lo = normal_cdf(min_c, forecast_c, SIGMA) if min_c is not None else 0.0
     hi = normal_cdf(max_c, forecast_c, SIGMA) if max_c is not None else 1.0
+    return max(0.01, min(0.99, hi - lo))
+
+
+def bucket_probability_sigma(forecast_c, min_c, max_c, sigma: float) -> float:
+    lo = normal_cdf(min_c, forecast_c, sigma) if min_c is not None else 0.0
+    hi = normal_cdf(max_c, forecast_c, sigma) if max_c is not None else 1.0
     return max(0.01, min(0.99, hi - lo))
 
 # ── Airport / METAR ───────────────────────────────────────────────────────────
@@ -589,6 +607,122 @@ def fetch_model_with_fallback(lat, lon, date_str, model) -> dict:
             "label": model["label"], "desc": model["desc"], "used_id": model["id"],
             "error": " | ".join(errors)}
 
+# ── Additional forecast sources: NWS, Tomorrow.io, Meteosource ───────────────
+
+def get_api_key(env_var: str) -> str:
+    """Read API key from Streamlit secrets or environment variable."""
+    try:
+        val = st.secrets.get(env_var, "")
+        if val:
+            return val
+    except Exception:
+        pass
+    return os.environ.get(env_var, "")
+
+
+@st.cache_data(ttl=1800)
+def fetch_nws_forecast(lat: float, lon: float, date_str: str) -> dict:
+    """Fetch daytime high from NWS api.weather.gov (US only, 7-day window)."""
+    r1 = requests.get(
+        f"{NWS_API}/points/{lat:.4f},{lon:.4f}",
+        headers={"User-Agent": "PolymarketWeatherChecker/2.0"},
+        timeout=15,
+    )
+    if r1.status_code == 404:
+        raise ValueError("NWS: location outside US coverage area")
+    r1.raise_for_status()
+    forecast_url = r1.json()["properties"]["forecast"]
+
+    r2 = requests.get(
+        forecast_url,
+        headers={"User-Agent": "PolymarketWeatherChecker/2.0"},
+        timeout=15,
+    )
+    r2.raise_for_status()
+    periods = r2.json()["properties"]["periods"]
+
+    for period in periods:
+        if not period["isDaytime"]:
+            continue
+        if period["startTime"][:10] == date_str:
+            temp_f = float(period["temperature"])
+            temp_c = round((temp_f - 32) * 5 / 9, 1)
+            return {
+                "max_c": temp_c, "min_c": None,
+                "max_f": round(temp_f, 1), "min_f": None,
+                "label": "NWS", "desc": "US National Weather Service (official)",
+                "error": None,
+            }
+    raise ValueError(f"NWS: no daytime period found for {date_str} (max 7-day window)")
+
+
+@st.cache_data(ttl=1800)
+def fetch_tomorrowio(lat: float, lon: float, date_str: str, api_key: str) -> dict:
+    """Fetch daily max temp from Tomorrow.io (global, requires API key)."""
+    if not api_key:
+        raise ValueError("Tomorrow.io API key not set")
+    params = {
+        "location": f"{lat:.6f},{lon:.6f}",
+        "timesteps": "1d",
+        "units": "metric",
+        "apikey": api_key,
+    }
+    r = requests.get(TOMORROW_API, params=params, timeout=15)
+    if r.status_code == 401:
+        raise ValueError("Tomorrow.io: invalid API key")
+    if r.status_code == 429:
+        raise ValueError("Tomorrow.io: rate limit exceeded (free tier: 25 req/hr)")
+    r.raise_for_status()
+    daily = r.json().get("timelines", {}).get("daily", [])
+    for day in daily:
+        if (day.get("time") or "")[:10] == date_str:
+            max_c = day.get("values", {}).get("temperatureMax")
+            min_c = day.get("values", {}).get("temperatureMin")
+            if max_c is None:
+                raise ValueError("Tomorrow.io: temperatureMax missing")
+            return {
+                "max_c": round(max_c, 1),
+                "min_c": round(min_c, 1) if min_c is not None else None,
+                "max_f": round(max_c * 9 / 5 + 32, 1),
+                "min_f": round(min_c * 9 / 5 + 32, 1) if min_c is not None else None,
+                "label": "Tomorrow.io", "desc": "Commercial AI forecast model (global)",
+                "error": None,
+            }
+    raise ValueError(f"Tomorrow.io: no data for {date_str} (free tier: 5-day window)")
+
+
+@st.cache_data(ttl=1800)
+def fetch_meteosource(lat: float, lon: float, date_str: str, api_key: str) -> dict:
+    """Fetch daily max temp from Meteosource (global, requires API key)."""
+    if not api_key:
+        raise ValueError("Meteosource API key not set")
+    params = {
+        "lat": f"{lat:.6f}", "lon": f"{lon:.6f}",
+        "sections": "daily", "language": "en", "units": "metric", "key": api_key,
+    }
+    r = requests.get(METEOSOURCE_API, params=params, timeout=15)
+    if r.status_code in (401, 403):
+        raise ValueError("Meteosource: invalid API key")
+    if r.status_code == 429:
+        raise ValueError("Meteosource: rate limit exceeded")
+    r.raise_for_status()
+    days = r.json().get("daily", {}).get("data", [])
+    for day in days:
+        if day.get("day") == date_str:
+            max_c = day.get("all_day", {}).get("temperature_max")
+            min_c = day.get("all_day", {}).get("temperature_min")
+            if max_c is None:
+                raise ValueError("Meteosource: temperature_max missing")
+            return {
+                "max_c": round(max_c, 1),
+                "min_c": round(min_c, 1) if min_c is not None else None,
+                "max_f": round(max_c * 9 / 5 + 32, 1),
+                "min_f": round(min_c * 9 / 5 + 32, 1) if min_c is not None else None,
+                "label": "Meteosource", "desc": "Meteosource global forecast",
+                "error": None,
+            }
+    raise ValueError(f"Meteosource: no data for {date_str}")
+
 # ── Polymarket helpers ────────────────────────────────────────────────────────
 
 def slug_from_url(url: str):
@@ -825,7 +959,7 @@ def extract_resolution_station(description: str) -> dict | None:
 
     # Station name in prose: "recorded at the Buckley Space Force Base Station"
     name_m = re.search(
-        r'recorded at(?: the)? ([A-Z][\w\s\-\.\']+?)(?:\s+[Ss]tation|\s+in degrees)',
+        r'recorded at(?: the)? ([A-Z][\w\s\-\.\']+(?)(?:\s+[Ss]tation|\s+in degrees)',
         description)
     station_name = name_m.group(1).strip() if name_m else ""
 
@@ -937,12 +1071,17 @@ def parse_markets(events_or_markets: list, city_filter: str | None = None) -> li
 
 def enrich_markets(markets: list, model_results: list,
                    ensemble_members: list | None = None,
-                   ensemble_by_model: dict | None = None) -> list:
+                   ensemble_by_model: dict | None = None,
+                   additional_sources: list | None = None,
+                   sigma: float = SIGMA) -> list:
     """
     Compute probability for each Polymarket bucket.
     Priority:  empirical ensemble probability  >  normal approx around deterministic.
+    Additional sources (NWS, Tomorrow.io, Meteosource) augment deterministic pool.
     """
     valid_det = [r for r in model_results if r.get("max_c") is not None]
+    if additional_sources:
+        valid_det = valid_det + [s for s in additional_sources if s.get("max_c") is not None and not s.get("error")]
     det_max   = [r["max_c"] for r in valid_det]
     enriched  = []
 
@@ -966,10 +1105,10 @@ def enrich_markets(markets: list, model_results: list,
                         if p is not None:
                             per_model.append((label, p))
         elif det_max:
-            probs      = [bucket_probability(fc, bucket.get("min_c"), bucket.get("max_c"))
+            probs      = [bucket_probability_sigma(fc, bucket.get("min_c"), bucket.get("max_c"), sigma)
                           for fc in det_max]
             model_prob = sum(probs) / len(probs)
-            method     = f"normal approx (σ={SIGMA}°C)"
+            method     = f"normal approx (σ={sigma:.1f}°C, {len(det_max)} sources)"
             per_model  = list(zip([r["label"] for r in valid_det], probs))
         else:
             enriched.append({**m, "model_prob": None, "edge": None,
@@ -1180,9 +1319,13 @@ def render_current_obs(obs: dict):
             )
 
 
-def render_forecast_table(model_results: list, date_str: str):
+def render_forecast_table(model_results: list, date_str: str,
+                          additional_sources: list | None = None,
+                          sigma: float = SIGMA, days_ahead: int = 5):
     valid   = [r for r in model_results if r.get("max_c") is not None]
-    con_c   = sum(r["max_c"] for r in valid) / len(valid) if valid else None
+    extra_valid = [s for s in (additional_sources or []) if s.get("max_c") is not None and not s.get("error")]
+    all_valid = valid + extra_valid
+    con_c   = sum(r["max_c"] for r in all_valid) / len(all_valid) if all_valid else None
 
     rows = []
     for r in model_results:
@@ -1202,8 +1345,8 @@ def render_forecast_table(model_results: list, date_str: str):
         con_f = c_to_f(con_c)
         rows.append({
             "Model":       "Consensus",
-            "Description": f"avg of {len(valid)} model{'s' if len(valid) != 1 else ''}",
-            "Max Temp":    f"{con_c:.1f}°C / {con_f:.1f}°F",
+            "Description": f"weighted avg of {len(all_valid)} source{'s' if len(all_valid) != 1 else ''} · σ={sigma:.1f}°C · {days_ahead}d ahead",
+            "Max Temp":    f"{con_c:.1f}°C / {c_to_f(con_c):.1f}°F",
             "Min Temp":    "—",
         })
 
@@ -1212,6 +1355,27 @@ def render_forecast_table(model_results: list, date_str: str):
         pd.DataFrame(rows).set_index("Model"),
         use_container_width=True,
     )
+
+    if additional_sources:
+        extra_rows = []
+        for s in additional_sources:
+            if s.get("error"):
+                extra_rows.append({"Source": s["label"], "Description": s.get("desc", ""),
+                                   "Max Temp": f"⚠ {s['error'][:120]}", "Min Temp": ""})
+            else:
+                extra_rows.append({
+                    "Source":      s["label"],
+                    "Description": s.get("desc", ""),
+                    "Max Temp":    f"{s['max_c']:.1f}°C / {s['max_f']:.1f}°F",
+                    "Min Temp":    (f"{s['min_c']:.1f}°C / {s['min_f']:.1f}°F"
+                                   if s.get("min_c") is not None else "—"),
+                })
+        st.caption("**Additional sources (NWS · Tomorrow.io · Meteosource):**")
+        st.dataframe(
+            pd.DataFrame(extra_rows).set_index("Source"),
+            use_container_width=True,
+        )
+
     return con_c
 
 
@@ -1490,6 +1654,13 @@ def run_analysis(city_input: str, date_str: str, markets_override=None):
         except Exception as e:
             st.warning(f"Current conditions unavailable: {e}")
 
+    # Compute forecast horizon and dynamic sigma
+    try:
+        days_ahead = max(0, (datetime.strptime(date_str, "%Y-%m-%d").date() - date.today()).days)
+    except Exception:
+        days_ahead = 5
+    sigma = dynamic_sigma(days_ahead)
+
     # Forecasts
     with st.spinner("Fetching model forecasts…"):
         model_results = [
@@ -1497,7 +1668,40 @@ def run_analysis(city_input: str, date_str: str, markets_override=None):
             for m in MODELS
         ]
 
-    render_forecast_table(model_results, date_str)
+    # Additional sources (NWS + optional API-key sources)
+    tomorrow_key    = get_api_key("TOMORROW_IO_KEY")
+    meteosource_key = get_api_key("METEOSOURCE_KEY")
+    additional_sources = []
+
+    with st.spinner("Fetching NWS forecast (US only)…"):
+        try:
+            nws = fetch_nws_forecast(location["lat"], location["lon"], date_str)
+            additional_sources.append(nws)
+        except Exception as e:
+            err = str(e)
+            if "outside US" not in err and "7-day window" not in err:
+                additional_sources.append({"label": "NWS", "desc": "US National Weather Service",
+                                           "max_c": None, "max_f": None, "error": err})
+
+    if tomorrow_key:
+        with st.spinner("Fetching Tomorrow.io forecast…"):
+            try:
+                tm = fetch_tomorrowio(location["lat"], location["lon"], date_str, tomorrow_key)
+                additional_sources.append(tm)
+            except Exception as e:
+                additional_sources.append({"label": "Tomorrow.io", "desc": "Commercial forecast",
+                                           "max_c": None, "max_f": None, "error": str(e)})
+
+    if meteosource_key:
+        with st.spinner("Fetching Meteosource forecast…"):
+            try:
+                ms = fetch_meteosource(location["lat"], location["lon"], date_str, meteosource_key)
+                additional_sources.append(ms)
+            except Exception as e:
+                additional_sources.append({"label": "Meteosource", "desc": "Meteosource forecast",
+                                           "max_c": None, "max_f": None, "error": str(e)})
+
+    render_forecast_table(model_results, date_str, additional_sources, sigma, days_ahead)
 
     # Probabilistic distribution — always shown; ensemble when available, det-model fallback otherwise
     pooled, by_model = [], {}
@@ -1527,7 +1731,8 @@ def run_analysis(city_input: str, date_str: str, markets_override=None):
                 st.warning(f"Polymarket search failed: {e}. Use the URL tab for direct lookup.")
 
     dist_members = pooled if len(pooled) >= 10 else (prob_samples or [])
-    enriched = enrich_markets(markets, model_results, dist_members, by_model)
+    valid_extra  = [s for s in additional_sources if s.get("max_c") is not None and not s.get("error")]
+    enriched = enrich_markets(markets, model_results, dist_members, by_model, valid_extra, sigma)
     render_markets(enriched)
     return model_results
 
@@ -1756,7 +1961,42 @@ st.set_page_config(
 )
 
 st.title("☁️ Polymarket Weather Checker")
-st.caption("ECMWF IFS · GFS-GraphCast · GFS  vs  Polymarket temperature markets")
+st.caption("ECMWF IFS · GFS-GraphCast · GFS · NWS · Tomorrow.io · Meteosource  vs  Polymarket temperature markets")
+
+with st.sidebar:
+    st.header("⚙ API Keys")
+    st.caption("Optional — enables additional forecast sources")
+    st.markdown("---")
+
+    tomorrow_input = st.text_input(
+        "Tomorrow.io API Key",
+        value="",
+        type="password",
+        placeholder="Paste key here…",
+        help="Free tier available at tomorrow.io  •  25 req/hr · 500 req/day",
+        key="sidebar_tomorrow_key",
+    )
+    if tomorrow_input.strip():
+        os.environ["TOMORROW_IO_KEY"] = tomorrow_input.strip()
+        st.success("Tomorrow.io key active ✓")
+
+    st.markdown("")
+
+    meteosource_input = st.text_input(
+        "Meteosource API Key",
+        value="",
+        type="password",
+        placeholder="Paste key here…",
+        help="Free tier available at meteosource.com  •  400 req/day",
+        key="sidebar_meteosource_key",
+    )
+    if meteosource_input.strip():
+        os.environ["METEOSOURCE_KEY"] = meteosource_input.strip()
+        st.success("Meteosource key active ✓")
+
+    st.markdown("---")
+    st.caption("🔒 Keys are used only in your browser session — never stored.")
+    st.caption("NWS (National Weather Service) is always loaded for US locations at no cost.")
 
 tab0, tab1, tab2 = st.tabs([
     "🔍 Discover All Markets",
