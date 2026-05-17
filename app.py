@@ -1119,34 +1119,58 @@ def enrich_markets(markets: list, model_results: list,
                              "per_model": [], "method": "no-bucket"})
             continue
 
-        if ensemble_members:
+        # Build per-model breakdown including BOTH deterministic sources AND ensemble groups
+        per_model = []
+
+        # Deterministic sources: each contributes one forecast + Gaussian probability
+        for r in valid_det:
+            p = bucket_probability_sigma(r["max_c"], bucket.get("min_c"), bucket.get("max_c"), sigma)
+            per_model.append({
+                "label":      r["label"],
+                "prob":       p,
+                "weight":     _model_weight(r["label"]),
+                "forecast_c": r.get("max_c"),
+                "forecast_f": r.get("max_f"),
+                "kind":       "deterministic",
+            })
+
+        # Ensemble groups: each contributes empirical probability + median forecast
+        if ensemble_by_model:
+            import statistics as _stats
+            for label, info in ensemble_by_model.items():
+                members = info.get("members") or []
+                if not members:
+                    continue
+                p = empirical_bucket_prob(members, bucket.get("min_c"), bucket.get("max_c"))
+                if p is None:
+                    continue
+                med_c = _stats.median(members)
+                per_model.append({
+                    "label":      label,
+                    "prob":       p,
+                    "weight":     _model_weight(label),
+                    "forecast_c": med_c,
+                    "forecast_f": med_c * 9 / 5 + 32,
+                    "kind":       "ensemble",
+                    "n_members":  len(members),
+                })
+
+        # Main probability: prefer empirical (ensemble) when available
+        if ensemble_members and len(ensemble_members) >= 10:
             model_prob = empirical_bucket_prob(
                 ensemble_members, bucket.get("min_c"), bucket.get("max_c"))
-            method     = f"empirical ({len(ensemble_members)} ensemble members)"
-            per_model  = []
-            if ensemble_by_model:
-                for label, info in ensemble_by_model.items():
-                    if info.get("members"):
-                        p = empirical_bucket_prob(
-                            info["members"], bucket.get("min_c"), bucket.get("max_c"))
-                        if p is not None:
-                            per_model.append({
-                                "label": label, "prob": p,
-                                "weight": _model_weight(label),
-                                "forecast_c": None, "forecast_f": None,
-                            })
+            n_groups = len([1 for i in (ensemble_by_model or {}).values() if i.get("members")])
+            method = (f"empirical probability from {len(ensemble_members)} ensemble members "
+                      f"across {n_groups} ensemble system{'s' if n_groups != 1 else ''}")
         elif det_max:
-            probs    = [bucket_probability_sigma(fc, bucket.get("min_c"), bucket.get("max_c"), sigma)
-                        for fc in det_max]
-            weights  = [_model_weight(r["label"]) for r in valid_det]
-            wsum     = sum(p * w for p, w in zip(probs, weights))
+            probs   = [bucket_probability_sigma(fc, bucket.get("min_c"), bucket.get("max_c"), sigma)
+                       for fc in det_max]
+            weights = [_model_weight(r["label"]) for r in valid_det]
+            wsum    = sum(p * w for p, w in zip(probs, weights))
             model_prob = wsum / sum(weights)
-            method   = f"weighted avg (σ={sigma:.1f}°C, {len(det_max)} sources)"
-            per_model = [
-                {"label": r["label"], "prob": p, "weight": w,
-                 "forecast_c": r.get("max_c"), "forecast_f": r.get("max_f")}
-                for r, p, w in zip(valid_det, probs, weights)
-            ]
+            method  = (f"weighted average of {len(det_max)} deterministic source"
+                       f"{'s' if len(det_max) != 1 else ''} (σ={sigma:.1f}°C, "
+                       f"weights: NWS×1.3, ECMWF IFS×1.2, GraphCast×1.1, others×1.0)")
         else:
             enriched.append({**m, "model_prob": None, "edge": None,
                              "per_model": [], "method": "no-data"})
@@ -1473,6 +1497,23 @@ def render_probability_section(date_str: str, model_results: list,
 
     st.caption(f"Source: {source}")
 
+    with st.expander("ℹ️ How to read this — what do P10, P50, P90 mean?"):
+        st.markdown(
+            "**Percentiles** describe the range of possible outcomes from the forecast:\n\n"
+            "- **P50 (median)** — half the simulations predict above this temperature, half below. "
+            "This is the single most likely value.\n"
+            "- **P10 (cool)** — 10% chance the actual max temperature ends up at or below this value. "
+            "Think of this as the **realistic floor**.\n"
+            "- **P90 (hot)** — 10% chance the actual max ends up at or above this value. "
+            "Think of this as the **realistic ceiling**.\n"
+            "- **P25 / P75** — interquartile range. 50% chance the actual reading lands between them.\n\n"
+            "**How to use this:** if you're betting on a market like *\"will it exceed 90°F?\"*, look at "
+            "P90. If even P90 is below 90°F, the market is very unlikely to resolve YES. "
+            "If even P10 is above 90°F, it is almost certain to resolve YES.\n\n"
+            "The **gap between P10 and P90** tells you how uncertain the forecast is — "
+            "tight range = high confidence; wide range = avoid large bets."
+        )
+
     q = empirical_quantiles(samples)
 
     # Quantile metrics
@@ -1480,16 +1521,25 @@ def render_probability_section(date_str: str, model_results: list,
         return f"{c:.1f}°C / {c*9/5+32:.1f}°F"
 
     c1, c2, c3, c4, c5 = st.columns(5)
-    with c1: st.metric("P10 (cool)",   fmt(q["p10"]))
-    with c2: st.metric("P25",          fmt(q["p25"]))
-    with c3: st.metric("P50 (median)", fmt(q["p50"]))
-    with c4: st.metric("P75",          fmt(q["p75"]))
-    with c5: st.metric("P90 (hot)",    fmt(q["p90"]))
+    with c1: st.metric("P10 (cool floor)",  fmt(q["p10"]))
+    with c2: st.metric("P25",               fmt(q["p25"]))
+    with c3: st.metric("P50 (median)",      fmt(q["p50"]))
+    with c4: st.metric("P75",               fmt(q["p75"]))
+    with c5: st.metric("P90 (hot ceiling)", fmt(q["p90"]))
+
+    spread_p10_p90 = q["p90"] - q["p10"]
+    if spread_p10_p90 <= 2.0:
+        spread_lbl = "✅ Tight range — high forecast confidence"
+    elif spread_p10_p90 <= 4.0:
+        spread_lbl = "🟡 Moderate range — typical forecast uncertainty"
+    else:
+        spread_lbl = "⚠️ Wide range — high uncertainty, avoid large bets"
 
     st.caption(
         f"Mean: **{fmt(q['mean'])}**  ·  "
-        f"Spread (σ): **{q['std']:.2f}°C**  ·  "
-        f"Range shown: {fmt(q['min'])} → {fmt(q['max'])}"
+        f"σ: **{q['std']:.2f}°C**  ·  "
+        f"P10→P90 range: **{spread_p10_p90:.1f}°C / {spread_p10_p90*9/5:.1f}°F**  ·  "
+        f"{spread_lbl}"
     )
 
     # Histogram per integer °F
@@ -1716,13 +1766,28 @@ def render_detailed_recommendation(enriched_markets: list, days_ahead: int, sigm
         # ── Narrative paragraphs ─────────────────────────────────────────────
         narrative = []
 
+        # Explain how the combined probability was computed
+        method_str = m.get("method", "")
+        if "empirical" in method_str:
+            method_explain = (
+                f"The combined **{mprob*100:.1f}%** probability comes from counting "
+                f"how many of the actual ensemble simulations land inside the target temperature range — "
+                f"this is the most accurate method when ensembles are available."
+            )
+        else:
+            method_explain = (
+                f"The combined **{mprob*100:.1f}%** probability is a **weighted average** of each source's "
+                f"individual probability. Sources with higher reliability (NWS, ECMWF IFS) count more "
+                f"than the baseline (GFS, Tomorrow.io, Meteosource)."
+            )
+
         # Lead
         if edge_pp >= 8:
             narrative.append(
                 f"The combined model forecast gives a **{mprob*100:.1f}% probability** "
                 f"that the temperature will land in {bucket_desc}, "
-                f"while the market is only pricing it at **{yes_p*100:.0f}¢**. "
-                f"That's a **{edge_pp:.1f} percentage-point gap** — large enough to be a real edge."
+                f"while the market is only pricing it at **{yes_p*100:.0f}¢** — "
+                f"a **{edge_pp:.1f}pp gap** in your favour."
             )
         elif edge_pp <= -8:
             narrative.append(
@@ -1736,6 +1801,8 @@ def render_detailed_recommendation(enriched_markets: list, days_ahead: int, sigm
                 f"Models say **{mprob*100:.1f}%** vs market at **{yes_p*100:.0f}¢** — "
                 f"a gap of only {edge_pp:+.1f}pp. This is within the noise margin; no strong edge."
             )
+
+        narrative.append(method_explain)
 
         # Consensus
         n_models = len([pm for pm in per_model if isinstance(pm, dict)])
@@ -1800,32 +1867,55 @@ def render_detailed_recommendation(enriched_markets: list, days_ahead: int, sigm
 
             # Per-model breakdown table
             if per_model:
-                st.markdown("**📊 Model breakdown:**")
+                st.markdown("**📊 Model breakdown — what each source predicts and how that translates to probability:**")
 
                 role_map = {
-                    "nws":        "US local (HRRR-based) — best for US ≤3d",
-                    "ecmwf ifs":  "European physics — globally best 3-10d",
-                    "graphcast":  "AI model (Google DeepMind) — strong 5-10d",
-                    "ecmwf aifs": "AI model (ECMWF) — strong at medium range",
-                    "gfs":        "NOAA physics model — solid global baseline",
-                    "tomorrow":   "Commercial aggregator",
-                    "meteosource":"Commercial aggregator",
+                    "nws":         "US National Weather Service — uses HRRR (4km), best for US ≤3 days",
+                    "ecmwf ifs":   "ECMWF European physics — globally most accurate 3-10 days",
+                    "graphcast":   "Google DeepMind AI — very strong 5-10 days",
+                    "ecmwf aifs":  "ECMWF AI model — strong at medium range",
+                    "gfs":         "NOAA GFS physics — solid global baseline",
+                    "tomorrow":    "Tomorrow.io commercial aggregator",
+                    "meteosource": "Meteosource commercial aggregator",
+                    "ecmwf ens":   "ECMWF ensemble (51 members) — gold standard for uncertainty",
+                    "gefs":        "NOAA ensemble (31 members) — US-focused uncertainty",
+                    "icon-eps":    "DWD German ensemble (40 members)",
+                    "geps":        "Environment Canada ensemble (21 members)",
                 }
 
+                # Sort: deterministic first, then ensemble; within each, by weight desc
+                pm_sorted = sorted(
+                    [pm for pm in per_model if isinstance(pm, dict)],
+                    key=lambda pm: (pm.get("kind") != "deterministic", -pm.get("weight", 1.0))
+                )
+
                 pm_rows = []
-                for pm in per_model:
-                    if not isinstance(pm, dict):
-                        continue
+                for pm in pm_sorted:
                     lbl    = pm["label"]
                     p      = pm["prob"]
                     fc     = pm.get("forecast_c")
                     w      = pm.get("weight", 1.0)
+                    kind   = pm.get("kind", "deterministic")
                     stars  = "★★★" if w >= 1.2 else "★★" if w >= 1.1 else "★"
                     role   = next((v for k, v in role_map.items() if k in lbl.lower()), "")
                     marker = " ⚠" if lbl in outlier_labels else ""
+
+                    # Forecast High — for ensemble groups, label as median
+                    if fc is None:
+                        fc_str = "—"
+                    elif kind == "ensemble":
+                        n_str = f" (median of {pm.get('n_members', '?')} members)"
+                        fc_str = f"{fc:.1f}°C  /  {fc * 9/5 + 32:.1f}°F{n_str}"
+                    else:
+                        fc_str = f"{fc:.1f}°C  /  {fc * 9/5 + 32:.1f}°F"
+
+                    # Kind tag
+                    type_str = "🧮 Ensemble" if kind == "ensemble" else "🛰 Deterministic"
+
                     pm_rows.append({
                         "Model":          lbl + marker,
-                        "Forecast High":  (f"{fc:.1f}°C  /  {fc*9/5+32:.1f}°F" if fc is not None else "—"),
+                        "Type":           type_str,
+                        "Forecast High":  fc_str,
                         "P(YES)":         f"{p*100:.1f}%",
                         "Reliability":    stars,
                         "Best for":       role,
@@ -1834,6 +1924,12 @@ def render_detailed_recommendation(enriched_markets: list, days_ahead: int, sigm
                 st.dataframe(pd.DataFrame(pm_rows).set_index("Model"),
                              use_container_width=True)
                 st.caption(f"{agree_icon} Model agreement: **{agree_label}**")
+                st.caption(
+                    "**Reading this table:** *Forecast High* = each source's predicted max temp for the day  ·  "
+                    "*P(YES)* = probability that this temp falls in the market's bucket  ·  "
+                    "*Reliability* = how much weight this source gets in the combined consensus  ·  "
+                    "⚠ marks an outlier (>10pp from the group)."
+                )
 
             # Analysis narrative
             st.markdown("**📝 Analysis:**")
