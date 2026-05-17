@@ -41,6 +41,3 @@ def stations_by_alias() -> dict:
             "name": f"{info.get('city','')} — {info.get('name','')}",
         }
     return out
-
-# ── Constants ──────────────────────────────────────────────────────────────
-
