@@ -1,8 +1,3 @@
-"""
-Polymarket Weather Checker — Streamlit version
-Forecasts: ECMWF IFS + GFS-GraphCast + GFS  vs  Polymarket temperature markets
-Current conditions: Open-Meteo live data (temp, wind, humidity + timestamp)
-"""
 import os
 import re
 import json
@@ -959,7 +954,7 @@ def extract_resolution_station(description: str) -> dict | None:
 
     # Station name in prose: "recorded at the Buckley Space Force Base Station"
     name_m = re.search(
-        r'recorded at(?: the)? ([A-Z][\w\s\-\.\']+(?)(?:\s+[Ss]tation|\s+in degrees)',
+        r'recorded at(?: the)? ([A-Z][\w\s\-\.\']+?)(?:\s+[Ss]tation|\s+in degrees)',
         description)
     station_name = name_m.group(1).strip() if name_m else ""
 
@@ -1962,41 +1957,6 @@ st.set_page_config(
 
 st.title("☁️ Polymarket Weather Checker")
 st.caption("ECMWF IFS · GFS-GraphCast · GFS · NWS · Tomorrow.io · Meteosource  vs  Polymarket temperature markets")
-
-with st.sidebar:
-    st.header("⚙ API Keys")
-    st.caption("Optional — enables additional forecast sources")
-    st.markdown("---")
-
-    tomorrow_input = st.text_input(
-        "Tomorrow.io API Key",
-        value="",
-        type="password",
-        placeholder="Paste key here…",
-        help="Free tier available at tomorrow.io  •  25 req/hr · 500 req/day",
-        key="sidebar_tomorrow_key",
-    )
-    if tomorrow_input.strip():
-        os.environ["TOMORROW_IO_KEY"] = tomorrow_input.strip()
-        st.success("Tomorrow.io key active ✓")
-
-    st.markdown("")
-
-    meteosource_input = st.text_input(
-        "Meteosource API Key",
-        value="",
-        type="password",
-        placeholder="Paste key here…",
-        help="Free tier available at meteosource.com  •  400 req/day",
-        key="sidebar_meteosource_key",
-    )
-    if meteosource_input.strip():
-        os.environ["METEOSOURCE_KEY"] = meteosource_input.strip()
-        st.success("Meteosource key active ✓")
-
-    st.markdown("---")
-    st.caption("🔒 Keys are used only in your browser session — never stored.")
-    st.caption("NWS (National Weather Service) is always loaded for US locations at no cost.")
 
 tab0, tab1, tab2 = st.tabs([
     "🔍 Discover All Markets",
