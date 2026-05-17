@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Polymarket Weather Checker</title>
-  <meta name="description" content="Compare ECMWF and GFS-GraphCast forecasts against Polymarket weather temperature markets to find edges.">
+  <meta name="description" content="Compare ECMWF, GFS, NWS, Tomorrow.io and Meteosource forecasts against Polymarket weather temperature markets to find edges.">
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -14,7 +14,7 @@
       <span class="header-icon">🌤</span>
       <div class="header-text">
         <h1>Polymarket Weather Checker</h1>
-        <p>ECMWF IFS &amp; GFS-GraphCast forecasts vs Polymarket temperature markets</p>
+        <p>ECMWF · GFS-GraphCast · GFS · NWS · Tomorrow.io · Meteosource vs Polymarket temperature markets</p>
       </div>
     </div>
   </header>
@@ -67,6 +67,23 @@
         </div>
       </form>
     </div>
+
+    <!-- Optional API keys for extra sources -->
+    <details class="settings-panel" id="api-settings">
+      <summary>⚙ API Keys — enables Tomorrow.io &amp; Meteosource</summary>
+      <div class="settings-grid">
+        <div class="form-field">
+          <label for="key-tomorrow">Tomorrow.io API Key <span class="key-hint">(<a href="https://app.tomorrow.io/signup" target="_blank" rel="noopener">free tier</a>)</span></label>
+          <input type="password" id="key-tomorrow" placeholder="Paste your Tomorrow.io key" autocomplete="off">
+        </div>
+        <div class="form-field">
+          <label for="key-meteosource">Meteosource API Key <span class="key-hint">(<a href="https://www.meteosource.com/register" target="_blank" rel="noopener">free tier</a>)</span></label>
+          <input type="password" id="key-meteosource" placeholder="Paste your Meteosource key" autocomplete="off">
+        </div>
+        <button type="button" class="btn-secondary" id="btn-save-keys">Save Keys</button>
+      </div>
+      <p class="settings-note">🔒 Keys are stored only in your browser's localStorage — sent directly to Tomorrow.io / Meteosource, never to any other server.</p>
+    </details>
 
     <div id="results"></div>
 

@@ -5,10 +5,13 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 const API = {
-  geocode:    'https://geocoding-api.open-meteo.com/v1/search',
-  forecast:   'https://api.open-meteo.com/v1/forecast',
-  ensemble:   'https://ensemble-api.open-meteo.com/v1/ensemble',
-  polymarket: 'https://gamma-api.polymarket.com',
+  geocode:     'https://geocoding-api.open-meteo.com/v1/search',
+  forecast:    'https://api.open-meteo.com/v1/forecast',
+  ensemble:    'https://ensemble-api.open-meteo.com/v1/ensemble',
+  polymarket:  'https://gamma-api.polymarket.com',
+  nws:         'https://api.weather.gov',
+  tomorrowio:  'https://api.tomorrow.io/v4/weather/forecast',
+  meteosource: 'https://www.meteosource.com/api/v1/free/point',
 };
 
 // Exact ICAO station coordinates for cities where Polymarket uses a specific
@@ -62,14 +65,15 @@ async function fetchWithCorsFallback(url) {
   }
 }
 
-// Model definitions. fallback is tried if primary fails.
+// Model definitions (Open-Meteo based). weight affects weighted consensus.
 const MODELS = [
   {
     key: 'ecmwf',
     id: 'ecmwf_ifs025',
     label: 'ECMWF IFS',
-    desc: 'European Centre — physics model',
+    desc: 'European Centre for Medium-Range Weather Forecasts',
     color: '#4e9af1',
+    weight: 1.2,
   },
   {
     key: 'graphcast',
@@ -80,6 +84,15 @@ const MODELS = [
     fallbackLabel: 'ECMWF AIFS',
     fallbackDesc: 'ECMWF AI model — graph neural network',
     color: '#f1c40f',
+    weight: 1.1,
+  },
+  {
+    key: 'gfs',
+    id: 'gfs025',
+    label: 'GFS',
+    desc: 'NOAA Global Forecast System 0.25°',
+    color: '#f0883e',
+    weight: 1.0,
   },
 ];
 
@@ -87,6 +100,20 @@ const WEATHER_KEYWORDS = [
   'temperature', 'high temp', 'degrees', '°', 'fahrenheit',
   'celsius', 'weather', 'hottest', 'warmest', 'exceed',
 ];
+
+// ─────────────────────────────────────────────────────────────────────────────
+// API Key management (browser localStorage)
+// ─────────────────────────────────────────────────────────────────────────────
+
+function getApiKey(provider) {
+  try { return localStorage.getItem(`apikey_${provider}`) || ''; }
+  catch (_) { return ''; }
+}
+
+function setApiKey(provider, key) {
+  try { localStorage.setItem(`apikey_${provider}`, key.trim()); }
+  catch (_) {}
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Pure math helpers
@@ -115,11 +142,33 @@ function normalCDF(x, mu, sigma) {
 }
 
 /**
+ * How many days from now until dateStr (rounded to nearest integer).
+ */
+function daysAheadFromDate(dateStr) {
+  const target = new Date(dateStr + 'T12:00:00Z');
+  const now = new Date();
+  return Math.max(0, Math.round((target - now) / (1000 * 60 * 60 * 24)));
+}
+
+/**
+ * Dynamic sigma (°C) based on forecast horizon.
+ * Shorter horizon → more accurate → tighter distribution.
+ */
+function sigmaForDays(daysAhead) {
+  if (daysAhead <= 1) return 1.2;
+  if (daysAhead <= 3) return 1.8;
+  if (daysAhead <= 7) return 2.5;
+  return 3.5;
+}
+
+/**
  * Gaussian probability that actual max temp falls within [minC, maxC].
- * sigma = 2.5 °C = typical day-ahead GFS/ECMWF MAE.
  */
 function bucketProbability(forecastC, minC, maxC) {
-  const sigma = 2.5;
+  return bucketProbabilityWithSigma(forecastC, minC, maxC, 2.5);
+}
+
+function bucketProbabilityWithSigma(forecastC, minC, maxC, sigma) {
   const lo = (minC !== null && minC !== undefined) ? normalCDF(minC, forecastC, sigma) : 0;
   const hi = (maxC !== null && maxC !== undefined) ? normalCDF(maxC, forecastC, sigma) : 1;
   return Math.max(0.01, Math.min(0.99, hi - lo));
@@ -129,42 +178,31 @@ function bucketProbability(forecastC, minC, maxC) {
 // Temperature bucket parser
 // ─────────────────────────────────────────────────────────────────────────────
 
-/**
- * Extract temperature bucket from a Polymarket market question.
- * Returns { minC, maxC } (either can be null for open-ended),
- * or null if no temperature range is found.
- */
 function parseTempBucket(question) {
   if (!question) return null;
   const q = question.toLowerCase();
 
-  // Determine unit
   const isF = /°f|fahrenheit/.test(q) ||
               (/\bdegrees?\b/.test(q) && !/celsius/.test(q) && !/°c/.test(q));
   const toC = v => isF ? Math.round((v - 32) * 5 / 9 * 100) / 100 : Math.round(v * 100) / 100;
 
   let m;
 
-  // "between X and Y" or "X to Y" or "X-Y"
   m = q.match(/between\s+(\d+\.?\d*)\s*(?:and|–|-|to)\s*(\d+\.?\d*)/);
   if (m) return { minC: toC(+m[1]), maxC: toC(+m[2]) };
 
   m = q.match(/(\d+\.?\d*)\s*(?:to|-)\s*(\d+\.?\d*)\s*(?:°|degrees?|f\b|c\b)/);
   if (m && +m[1] < +m[2]) return { minC: toC(+m[1]), maxC: toC(+m[2]) };
 
-  // "no more than X" must be tested BEFORE "more than X" to avoid false match
   m = q.match(/\bno\s+more\s+than\s+(\d+\.?\d*)/);
   if (m) return { minC: null, maxC: toC(+m[1]) };
 
-  // "above X" / "exceed X" / "over X" / "at least X" / "more than X" / "higher than X"
   m = q.match(/(?:above|exceed[s]?|over|higher than|at least|more than)\s+(\d+\.?\d*)/);
   if (m) return { minC: toC(+m[1]), maxC: null };
 
-  // "below X" / "under X" / "less than X" / "at most X" / "lower than X" / "fewer than X"
   m = q.match(/(?:below|under|less than|lower than|at most|fewer than)\s+(\d+\.?\d*)/);
   if (m) return { minC: null, maxC: toC(+m[1]) };
 
-  // "reach X" / "hit X" (implies >= X)
   m = q.match(/(?:reach|hit)\s+(\d+\.?\d*)/);
   if (m) return { minC: toC(+m[1]), maxC: null };
 
@@ -182,18 +220,10 @@ const MONTHS = {
   sep: 9, oct: 10, nov: 11, dec: 12,
 };
 
-/**
- * Extract a YYYY-MM-DD date string from a Polymarket question.
- * Examples:
- *   "on June 5"            → "2026-06-05" (next occurrence)
- *   "on May 15, 2026"      → "2026-05-15"
- *   "on July 4th, 2025"    → "2025-07-04"
- */
 function parseDateFromQuestion(question) {
   if (!question) return null;
   const q = question.toLowerCase();
 
-  // "on/for MonthName Day[th|st|nd|rd][,] [Year]"
   const m = q.match(
     /(?:on|for)\s+([a-z]+)\s+(\d{1,2})(?:st|nd|rd|th)?(?:,?\s+(\d{4}))?/
   );
@@ -207,8 +237,6 @@ function parseDateFromQuestion(question) {
 
   let year = m[3] ? parseInt(m[3], 10) : null;
   if (!year) {
-    // Pick next occurrence of this month/day. Compare dates only (no time)
-    // so "today" doesn't get bumped to next year.
     const now = new Date();
     const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
     year = now.getFullYear();
@@ -219,14 +247,9 @@ function parseDateFromQuestion(question) {
   return `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
 }
 
-/**
- * Extract date from a Polymarket slug like "...-on-may-7-2026".
- * Returns YYYY-MM-DD or null.
- */
 function parseDateFromSlug(slug) {
   if (!slug) return null;
   const s = slug.toLowerCase();
-  // Pattern: month-day-year, e.g. "may-7-2026" or "may-7th-2026"
   const m = s.match(/(january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|jun|jul|aug|sep|oct|nov|dec)-(\d{1,2})(?:st|nd|rd|th)?-(\d{4})/);
   if (!m) return null;
   const month = MONTHS[m[1]];
@@ -241,30 +264,18 @@ function parseDateFromSlug(slug) {
 // City name extractor from market question
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Regex that marks the end of a city name inside a question
 const CITY_END_RE = /\b(?:on|for|in\s+\d|exceed[s]?|above|below|be\s+above|be\s+below|be\s+over|reach|will\s+be|temperature\b)/;
 
-/**
- * Extract city name from a Polymarket question like:
- *   "Will the high temperature in Los Angeles on June 5 be above 90°F?"
- *   "Will the high temp in New York City exceed 75 degrees on July 4?"
- */
 function parseCityFromQuestion(question) {
   if (!question) return null;
 
-  // Find "in {CITY}" — city starts with uppercase, can have spaces/hyphens
   const m = question.match(/\bin\s+([A-Z][A-Za-z\s'.-]+?)(?:\s+(?:on|for|exceed|above|below|be\s|reach|temperature\b|(?=\d)))/);
   if (m) return m[1].trim().replace(/\s+/g, ' ');
 
-  // Fallback: "in {CITY}" without clear terminator — take first 3 words
   const m2 = question.match(/\bin\s+((?:[A-Z][a-z]+\s?){1,3})/);
   return m2 ? m2[1].trim() : null;
 }
 
-/**
- * Try to extract city from a Polymarket slug as a fallback.
- * "los-angeles-high-temperature-june-5-2025" → "Los Angeles"
- */
 function parseCityFromSlug(slug) {
   if (!slug) return null;
   const stopWords = ['high', 'low', 'temperature', 'temp', 'weather', 'degrees', 'fahrenheit',
@@ -286,20 +297,12 @@ function parseCityFromSlug(slug) {
 // Station helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-/**
- * Extract ICAO station code from a Weather Underground URL embedded in text.
- * e.g. "https://www.wunderground.com/history/daily/us/co/aurora/KBKF" → "KBKF"
- */
 function extractIcaoFromWunderground(text) {
   if (!text) return null;
   const m = text.match(/wunderground\.com\/history\/daily\/[^/]+\/[^/]+\/[^/]+\/([A-Z]{4})\b/);
   return m ? m[1] : null;
 }
 
-/**
- * Look up a city name in POLYMARKET_STATIONS by alias or city name.
- * Returns { icao, station } or null.
- */
 function lookupStationByCity(cityName) {
   const lower = cityName.toLowerCase().trim();
   for (const [icao, st] of Object.entries(POLYMARKET_STATIONS)) {
@@ -341,7 +344,7 @@ async function geocodeCity(city) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Weather forecasts
+// Open-Meteo forecasts (ECMWF / GFS-GraphCast / GFS)
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function fetchSingleModel(lat, lon, dateStr, modelId) {
@@ -383,17 +386,12 @@ async function fetchSingleModel(lat, lon, dateStr, modelId) {
   };
 }
 
-/**
- * Fetch forecast for a model definition, trying primary then fallback.
- * Returns { maxC, minC, maxF, minF, usedId, label, desc, color, error? }
- */
 async function fetchModelWithFallback(lat, lon, dateStr, model) {
   const attempts = [
     { id: model.id, label: model.label, desc: model.desc },
     model.fallback
       ? { id: model.fallback, label: model.fallbackLabel, desc: model.fallbackDesc }
       : null,
-    // last-resort: any model (Open-Meteo's default best forecast)
     { id: 'best_match', label: model.label + ' (best_match)', desc: model.desc },
   ].filter(Boolean);
 
@@ -401,7 +399,7 @@ async function fetchModelWithFallback(lat, lon, dateStr, model) {
   for (const attempt of attempts) {
     try {
       const f = await fetchSingleModel(lat, lon, dateStr, attempt.id);
-      return { ...f, usedId: attempt.id, label: attempt.label, desc: attempt.desc, color: model.color };
+      return { ...f, usedId: attempt.id, label: attempt.label, desc: attempt.desc, color: model.color, weight: model.weight || 1.0 };
     } catch (e) {
       errors.push(`[${attempt.id}] ${e.message}`);
       console.warn(`[${attempt.id}] ${e.message}`);
@@ -409,7 +407,7 @@ async function fetchModelWithFallback(lat, lon, dateStr, model) {
   }
   return {
     maxC: null, minC: null, maxF: null, minF: null,
-    usedId: model.id, label: model.label, desc: model.desc, color: model.color,
+    usedId: model.id, label: model.label, desc: model.desc, color: model.color, weight: model.weight || 1.0,
     error: errors.join(' | ') || `All attempts failed for ${model.label}`,
   };
 }
@@ -424,11 +422,6 @@ const ENSEMBLE_MODELS = [
   { id: 'gfs025',       label: 'GFS 0.25° Ensemble',       members: 31 },
 ];
 
-/**
- * Fetch ensemble daily max temperatures for a single date.
- * Tries ECMWF → ICON → GFS in order; returns first success.
- * Returns { members: number[], modelId, memberCount } or null.
- */
 async function fetchEnsembleForecast(lat, lon, dateStr) {
   for (const em of ENSEMBLE_MODELS) {
     try {
@@ -474,10 +467,6 @@ async function fetchEnsembleForecast(lat, lon, dateStr) {
   return null;
 }
 
-/**
- * Build probability distribution from ensemble members.
- * Returns percentiles, mean, stddev, and 1°C histogram bins.
- */
 function buildEnsembleDistribution(members) {
   if (!members || !members.length) return null;
   const sorted = [...members].sort((a, b) => a - b);
@@ -522,6 +511,135 @@ function buildEnsembleDistribution(members) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// NWS (National Weather Service) — free, US-only, no API key
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function fetchNWSForecast(lat, lon, dateStr) {
+  // Step 1: resolve grid point
+  const pointsUrl = `${API.nws}/points/${lat.toFixed(4)},${lon.toFixed(4)}`;
+  const pointsResp = await fetch(pointsUrl, {
+    headers: { 'User-Agent': 'PolymarketWeatherChecker/2.0 (github.com/shaytheboss)' },
+  });
+  if (!pointsResp.ok) {
+    if (pointsResp.status === 404) throw new Error('NWS: location outside US coverage area');
+    throw new Error(`NWS points API: HTTP ${pointsResp.status}`);
+  }
+  const pointsData = await pointsResp.json();
+  const forecastUrl = pointsData.properties?.forecast;
+  if (!forecastUrl) throw new Error('NWS: no forecast URL returned');
+
+  // Step 2: fetch daily forecast
+  const forecastResp = await fetch(forecastUrl, {
+    headers: { 'User-Agent': 'PolymarketWeatherChecker/2.0 (github.com/shaytheboss)' },
+  });
+  if (!forecastResp.ok) throw new Error(`NWS forecast: HTTP ${forecastResp.status}`);
+  const forecastData = await forecastResp.json();
+
+  const periods = forecastData.properties?.periods || [];
+
+  // Find daytime high for the target date
+  let maxTempF = null;
+  for (const period of periods) {
+    if (!period.isDaytime) continue;
+    const periodStart = new Date(period.startTime);
+    const periodDateStr = periodStart.toISOString().slice(0, 10);
+    if (periodDateStr === dateStr) {
+      maxTempF = period.temperature;
+      break;
+    }
+  }
+  if (maxTempF == null) throw new Error(`NWS: no daytime forecast for ${dateStr} (may be beyond 7-day window)`);
+
+  const maxC = Math.round((maxTempF - 32) * 5 / 9 * 10) / 10;
+  return {
+    maxC,
+    minC: null,
+    maxF: Math.round(maxTempF * 10) / 10,
+    minF: null,
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tomorrow.io — commercial, global, requires API key
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function fetchTomorrowIO(lat, lon, dateStr, apiKey) {
+  if (!apiKey) throw new Error('Tomorrow.io API key not set');
+
+  const url = new URL(API.tomorrowio);
+  url.searchParams.set('location', `${lat.toFixed(6)},${lon.toFixed(6)}`);
+  url.searchParams.set('timesteps', '1d');
+  url.searchParams.set('units', 'metric');
+  url.searchParams.set('apikey', apiKey);
+
+  const resp = await fetch(url);
+  if (!resp.ok) {
+    const body = await resp.text().catch(() => '');
+    let hint = '';
+    if (resp.status === 401) hint = ' — check your API key';
+    else if (resp.status === 429) hint = ' — rate limit exceeded (free tier: 25 req/hr)';
+    throw new Error(`Tomorrow.io: HTTP ${resp.status}${hint}${body ? ': ' + body.slice(0, 100) : ''}`);
+  }
+  const data = await resp.json();
+
+  const daily = data.timelines?.daily || [];
+  const dayData = daily.find(d => (d.time || '').slice(0, 10) === dateStr);
+  if (!dayData) throw new Error(`Tomorrow.io: no data for ${dateStr} (may be beyond 5-day free window)`);
+
+  const maxC = dayData.values?.temperatureMax;
+  const minC = dayData.values?.temperatureMin;
+  if (maxC == null) throw new Error('Tomorrow.io: temperatureMax missing in response');
+
+  return {
+    maxC: Math.round(maxC * 10) / 10,
+    minC: minC != null ? Math.round(minC * 10) / 10 : null,
+    maxF: Math.round((maxC * 9 / 5 + 32) * 10) / 10,
+    minF: minC != null ? Math.round((minC * 9 / 5 + 32) * 10) / 10 : null,
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Meteosource — commercial, global, requires API key
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function fetchMeteosource(lat, lon, dateStr, apiKey) {
+  if (!apiKey) throw new Error('Meteosource API key not set');
+
+  const url = new URL(API.meteosource);
+  url.searchParams.set('lat', lat.toFixed(6));
+  url.searchParams.set('lon', lon.toFixed(6));
+  url.searchParams.set('sections', 'daily');
+  url.searchParams.set('language', 'en');
+  url.searchParams.set('units', 'metric');
+  url.searchParams.set('key', apiKey);
+
+  const resp = await fetch(url);
+  if (!resp.ok) {
+    const body = await resp.text().catch(() => '');
+    let hint = '';
+    if (resp.status === 401 || resp.status === 403) hint = ' — check your API key';
+    else if (resp.status === 429) hint = ' — rate limit exceeded';
+    throw new Error(`Meteosource: HTTP ${resp.status}${hint}${body ? ': ' + body.slice(0, 100) : ''}`);
+  }
+  const data = await resp.json();
+
+  const days = data.daily?.data || [];
+  const dayData = days.find(d => d.day === dateStr);
+  if (!dayData) throw new Error(`Meteosource: no data for ${dateStr}`);
+
+  const maxC = dayData.all_day?.temperature_max;
+  const minC = dayData.all_day?.temperature_min;
+  if (maxC == null) throw new Error('Meteosource: temperature_max missing in response');
+
+  return {
+    maxC: Math.round(maxC * 10) / 10,
+    minC: minC != null ? Math.round(minC * 10) / 10 : null,
+    maxF: Math.round((maxC * 9 / 5 + 32) * 10) / 10,
+    minF: minC != null ? Math.round((minC * 9 / 5 + 32) * 10) / 10 : null,
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Polymarket market fetching and parsing
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -535,12 +653,9 @@ function parseMarketsFromEvents(events, cityFilter) {
       const question = market.question || '';
       const ql = question.toLowerCase();
 
-      // Must mention weather/temperature keywords
       if (!WEATHER_KEYWORDS.some(kw => ql.includes(kw))) continue;
-      // Must mention the city (if filter given)
       if (filterLower && !ql.includes(filterLower)) continue;
 
-      // Parse prices (Gamma API returns JSON string or array)
       let prices = [0.5, 0.5];
       try {
         const raw = market.outcomePrices;
@@ -550,7 +665,6 @@ function parseMarketsFromEvents(events, cityFilter) {
         }
       } catch (_) {}
 
-      // Parse outcome names
       let outcomes = ['YES', 'NO'];
       try {
         const raw = market.outcomes;
@@ -588,7 +702,6 @@ async function searchPolymarketByCity(cityName) {
   const data = await resp.json();
   const events = Array.isArray(data) ? data : (data.data || []);
 
-  // City might appear with short name (e.g. "NYC" for "New York City")
   const shortName = cityName.split(' ').length > 2
     ? cityName.split(',')[0].split(' ').slice(0, 2).join(' ')
     : cityName;
@@ -618,37 +731,52 @@ function slugFromPolymarketUrl(raw) {
 // Core analysis pipeline
 // ─────────────────────────────────────────────────────────────────────────────
 
-function buildAnalysis(location, dateStr, modelResults, markets, ensemble = null) {
-  const validForecasts = modelResults.filter(r => r.maxC != null);
-  const allMaxC = validForecasts.map(r => r.maxC);
-  const consensusC = allMaxC.length
-    ? allMaxC.reduce((a, b) => a + b, 0) / allMaxC.length
+function buildAnalysis(location, dateStr, modelResults, markets, ensemble = null, additionalSources = [], sourceErrors = []) {
+  const daysAhead = daysAheadFromDate(dateStr);
+  const sigma = sigmaForDays(daysAhead);
+
+  // Combine Open-Meteo models + additional sources for weighted consensus
+  const validModels = modelResults.filter(r => r.maxC != null);
+  const validExternal = additionalSources.filter(s => s.maxC != null);
+  const allForecasts = [
+    ...validModels.map(m => ({ maxC: m.maxC, label: m.label, weight: m.weight || 1.0 })),
+    ...validExternal.map(s => ({ maxC: s.maxC, label: s.label, weight: s.weight || 1.0 })),
+  ];
+
+  const totalWeight = allForecasts.reduce((s, f) => s + f.weight, 0);
+  const consensusC = allForecasts.length
+    ? allForecasts.reduce((s, f) => s + f.maxC * f.weight, 0) / totalWeight
     : null;
-  const consensusF = consensusC != null ? consensusC * 9 / 5 + 32 : null;
+  const consensusF = consensusC != null ? Math.round((consensusC * 9 / 5 + 32) * 10) / 10 : null;
 
   const marketsWithEdge = markets.map(m => {
-    if (!m.bucket || !allMaxC.length) {
+    if (!m.bucket || !allForecasts.length) {
       return { ...m, modelProb: null, edge: null, perModelProbs: [], reason: m.bucket ? null : 'bucket-unparsed' };
     }
     const { minC, maxC } = m.bucket;
-    const perModelProbs = validForecasts.map(f => ({
+    const perModelProbs = allForecasts.map(f => ({
       label: f.label,
-      prob: bucketProbability(f.maxC, minC, maxC),
+      prob: bucketProbabilityWithSigma(f.maxC, minC, maxC, sigma),
       maxC: f.maxC,
+      weight: f.weight,
     }));
-    const modelProb = perModelProbs.reduce((s, p) => s + p.prob, 0) / perModelProbs.length;
+    const totalW = perModelProbs.reduce((s, p) => s + p.weight, 0);
+    const modelProb = perModelProbs.reduce((s, p) => s + p.prob * p.weight, 0) / totalW;
     const edge = modelProb - m.yesPrice;
-    return { ...m, modelProb, edge, perModelProbs };
+    return { ...m, modelProb, edge, perModelProbs, daysAhead, sigma };
   });
 
-  return { location, dateStr, models: modelResults, consensusC, consensusF, markets: marketsWithEdge, ensemble };
+  return {
+    location, dateStr, models: modelResults, consensusC, consensusF,
+    markets: marketsWithEdge, ensemble, additionalSources, sourceErrors,
+    daysAhead, sigma,
+  };
 }
 
 async function analyzeByCity(cityInput, dateStr) {
   validateDate(dateStr);
   const location = await geocodeCity(cityInput);
 
-  // If this city maps to a known Polymarket ICAO station, use exact coordinates
   const stLookup = lookupStationByCity(cityInput);
   if (stLookup) {
     const { icao, station } = stLookup;
@@ -658,7 +786,13 @@ async function analyzeByCity(cityInput, dateStr) {
     location.displayName += ` (station ${icao})`;
   }
 
-  const [modelResults, markets, ensembleRaw] = await Promise.all([
+  const tomorrowKey = getApiKey('tomorrowio');
+  const meteosourceKey = getApiKey('meteosource');
+
+  const [
+    modelResults, markets, ensembleRaw,
+    nwsRaw, tomorrowRaw, meteosourceRaw,
+  ] = await Promise.all([
     Promise.all(MODELS.map(m => fetchModelWithFallback(location.lat, location.lon, dateStr, m))),
     searchPolymarketByCity(location.name).catch(e => {
       console.warn('Polymarket search failed:', e.message);
@@ -668,13 +802,41 @@ async function analyzeByCity(cityInput, dateStr) {
       console.warn('Ensemble fetch failed:', e.message);
       return null;
     }),
+    fetchNWSForecast(location.lat, location.lon, dateStr).catch(e => {
+      console.warn('NWS failed:', e.message);
+      return { _error: e.message };
+    }),
+    tomorrowKey
+      ? fetchTomorrowIO(location.lat, location.lon, dateStr, tomorrowKey).catch(e => ({ _error: e.message }))
+      : Promise.resolve(null),
+    meteosourceKey
+      ? fetchMeteosource(location.lat, location.lon, dateStr, meteosourceKey).catch(e => ({ _error: e.message }))
+      : Promise.resolve(null),
   ]);
 
   const ensemble = ensembleRaw
     ? { ...ensembleRaw, dist: buildEnsembleDistribution(ensembleRaw.members) }
     : null;
 
-  return buildAnalysis(location, dateStr, modelResults, markets, ensemble);
+  const additionalSources = [
+    nwsRaw && !nwsRaw._error
+      ? { ...nwsRaw, label: 'NWS', desc: 'US National Weather Service (official)', color: '#a371f7', weight: 1.3 }
+      : null,
+    tomorrowRaw && !tomorrowRaw._error
+      ? { ...tomorrowRaw, label: 'Tomorrow.io', desc: 'Commercial AI weather model', color: '#79c0ff', weight: 1.0 }
+      : null,
+    meteosourceRaw && !meteosourceRaw._error
+      ? { ...meteosourceRaw, label: 'Meteosource', desc: 'Meteosource global forecast', color: '#56d364', weight: 1.0 }
+      : null,
+  ].filter(Boolean);
+
+  const sourceErrors = [
+    nwsRaw?._error ? { label: 'NWS', error: nwsRaw._error } : null,
+    tomorrowRaw?._error ? { label: 'Tomorrow.io', error: tomorrowRaw._error } : null,
+    meteosourceRaw?._error ? { label: 'Meteosource', error: meteosourceRaw._error } : null,
+  ].filter(Boolean);
+
+  return buildAnalysis(location, dateStr, modelResults, markets, ensemble, additionalSources, sourceErrors);
 }
 
 async function analyzeByUrl(rawUrl) {
@@ -687,7 +849,6 @@ async function analyzeByUrl(rawUrl) {
     throw new Error('No temperature/weather markets found in this Polymarket event. Make sure the URL points to a weather temperature market.');
   }
 
-  // Extract city and date from the first parseable market question
   let city = null, dateStr = null;
   for (const m of markets) {
     city = city || parseCityFromQuestion(m.question) || parseCityFromSlug(slug);
@@ -695,10 +856,7 @@ async function analyzeByUrl(rawUrl) {
     if (city && dateStr) break;
   }
 
-  // Fallback: extract date from the slug itself (e.g. "...-on-may-7-2026")
   if (!dateStr) dateStr = parseDateFromSlug(slug);
-  // Fix year-mismatch: if the slug has an explicit year and it differs from
-  // what was parsed from the question, trust the slug.
   const slugDate = parseDateFromSlug(slug);
   if (slugDate && dateStr && slugDate.slice(0, 4) !== dateStr.slice(0, 4)) {
     dateStr = slugDate;
@@ -707,50 +865,71 @@ async function analyzeByUrl(rawUrl) {
   if (!city) throw new Error(`Could not extract city from market question: "${markets[0].question}". Use the "By City" tab instead.`);
   if (!dateStr) throw new Error(`Could not extract date from market question: "${markets[0].question}". Use the "By City" tab instead.`);
 
-  // Try to resolve the exact ICAO station Polymarket uses (embedded as a
-  // Weather Underground URL in the event description).
   const icao = extractIcaoFromWunderground(event.description || '');
   let location;
   if (icao && POLYMARKET_STATIONS[icao]) {
     const st = POLYMARKET_STATIONS[icao];
     location = {
-      lat: st.lat,
-      lon: st.lon,
-      name: city,
-      admin: st.state || '',
-      country: 'US',
-      countryCode: 'US',
+      lat: st.lat, lon: st.lon,
+      name: city, admin: st.state || '', country: 'US', countryCode: 'US',
       timezone: 'auto',
       displayName: `${city} (${icao} — ${st.city}, ${st.state})`,
       icao,
     };
   } else {
     location = await geocodeCity(city);
-    if (icao) location.icao = icao; // store even if not in table
+    if (icao) location.icao = icao;
   }
 
-  // Date might be far in the future (Polymarket markets can be months ahead).
-  // Attempt forecast anyway; Open-Meteo will return an error if out of range.
-  const [modelResults, ensembleRaw] = await Promise.all([
+  const tomorrowKey = getApiKey('tomorrowio');
+  const meteosourceKey = getApiKey('meteosource');
+
+  const [modelResults, ensembleRaw, nwsRaw, tomorrowRaw, meteosourceRaw] = await Promise.all([
     Promise.all(MODELS.map(m => fetchModelWithFallback(location.lat, location.lon, dateStr, m))),
     fetchEnsembleForecast(location.lat, location.lon, dateStr).catch(e => {
       console.warn('Ensemble fetch failed:', e.message);
       return null;
     }),
+    fetchNWSForecast(location.lat, location.lon, dateStr).catch(e => {
+      console.warn('NWS failed:', e.message);
+      return { _error: e.message };
+    }),
+    tomorrowKey
+      ? fetchTomorrowIO(location.lat, location.lon, dateStr, tomorrowKey).catch(e => ({ _error: e.message }))
+      : Promise.resolve(null),
+    meteosourceKey
+      ? fetchMeteosource(location.lat, location.lon, dateStr, meteosourceKey).catch(e => ({ _error: e.message }))
+      : Promise.resolve(null),
   ]);
 
   const ensemble = ensembleRaw
     ? { ...ensembleRaw, dist: buildEnsembleDistribution(ensembleRaw.members) }
     : null;
 
-  return buildAnalysis(location, dateStr, modelResults, markets, ensemble);
+  const additionalSources = [
+    nwsRaw && !nwsRaw._error
+      ? { ...nwsRaw, label: 'NWS', desc: 'US National Weather Service (official)', color: '#a371f7', weight: 1.3 }
+      : null,
+    tomorrowRaw && !tomorrowRaw._error
+      ? { ...tomorrowRaw, label: 'Tomorrow.io', desc: 'Commercial AI weather model', color: '#79c0ff', weight: 1.0 }
+      : null,
+    meteosourceRaw && !meteosourceRaw._error
+      ? { ...meteosourceRaw, label: 'Meteosource', desc: 'Meteosource global forecast', color: '#56d364', weight: 1.0 }
+      : null,
+  ].filter(Boolean);
+
+  const sourceErrors = [
+    nwsRaw?._error ? { label: 'NWS', error: nwsRaw._error } : null,
+    tomorrowRaw?._error ? { label: 'Tomorrow.io', error: tomorrowRaw._error } : null,
+    meteosourceRaw?._error ? { label: 'Meteosource', error: meteosourceRaw._error } : null,
+  ].filter(Boolean);
+
+  return buildAnalysis(location, dateStr, modelResults, markets, ensemble, additionalSources, sourceErrors);
 }
 
 function validateDate(dateStr) {
   const d = new Date(dateStr + 'T12:00:00Z');
   if (isNaN(d.getTime())) throw new Error(`Invalid date: ${dateStr}`);
-  // Allow 1 day tolerance for timezone differences (e.g. user in Israel
-  // checking a date that's still "today" in the US).
   const yesterday = new Date();
   yesterday.setHours(0, 0, 0, 0);
   yesterday.setDate(yesterday.getDate() - 1);
@@ -806,8 +985,8 @@ function renderLocationCard(location, dateStr) {
     </div>`;
 }
 
-function renderForecastCard(models, consensusC, consensusF) {
-  const rows = models.map(m => {
+function renderForecastCard(models, consensusC, consensusF, additionalSources = [], sourceErrors = [], daysAhead = 5, sigma = 2.5) {
+  const modelRows = models.map(m => {
     if (m.error || m.maxC == null) {
       return `<tr>
         <td>
@@ -829,10 +1008,28 @@ function renderForecastCard(models, consensusC, consensusF) {
     </tr>`;
   });
 
+  const extraRows = additionalSources.map(s => `<tr>
+    <td>
+      <span class="model-dot" style="background:${s.color}"></span>
+      <strong>${esc(s.label)}</strong>
+      <small class="model-desc">${esc(s.desc)}</small>
+    </td>
+    <td><span class="temp-primary">${fC(s.maxC)}</span> <span class="temp-secondary">/ ${fF(s.maxF)}</span></td>
+    <td class="temp-secondary">${s.minC != null ? `${fC(s.minC)} / ${fF(s.minF)}` : '—'}</td>
+  </tr>`);
+
+  const errorRows = sourceErrors.map(e => `<tr>
+    <td><strong>${esc(e.label)}</strong> <small class="model-desc">unavailable</small></td>
+    <td colspan="2" class="error-cell">⚠ ${esc(e.error)}</td>
+  </tr>`);
+
+  const dividerRow = (additionalSources.length || sourceErrors.length) ? `
+    <tr class="source-divider"><td colspan="3">Additional sources</td></tr>` : '';
+
   const consensusRow = consensusC != null ? `
     <tr class="consensus-row">
-      <td><strong>Consensus</strong> <small class="model-desc">avg of available models</small></td>
-      <td><span class="temp-primary">${fC(consensusC)}</span> <span class="temp-secondary">/ ${fF(consensusF)}</span></td>
+      <td><strong>Consensus</strong> <small class="model-desc">weighted avg · σ=${sigma.toFixed(1)}°C · ${daysAhead}d ahead</small></td>
+      <td><span class="temp-primary">${fC(Math.round(consensusC * 10) / 10)}</span> <span class="temp-secondary">/ ${fF(consensusF)}</span></td>
       <td>—</td>
     </tr>` : '';
 
@@ -840,8 +1037,8 @@ function renderForecastCard(models, consensusC, consensusF) {
     <div class="card">
       <div class="card-label">Temperature Forecast</div>
       <table class="forecast-table">
-        <thead><tr><th>Model</th><th>Max Temp</th><th>Min Temp</th></tr></thead>
-        <tbody>${rows.join('')}${consensusRow}</tbody>
+        <thead><tr><th>Model / Source</th><th>Max Temp</th><th>Min Temp</th></tr></thead>
+        <tbody>${modelRows.join('')}${dividerRow}${extraRows.join('')}${errorRows.join('')}${consensusRow}</tbody>
       </table>
     </div>`;
 }
@@ -866,7 +1063,6 @@ function renderMarketsCard(markets, models) {
         Try the <strong>"By Polymarket URL"</strong> tab and paste the market URL directly.</p>
       </div>`;
   }
-  // Sort: largest absolute edge first
   const sorted = [...realMarkets].sort((a, b) => Math.abs(b.edge ?? 0) - Math.abs(a.edge ?? 0));
 
   const rows = sorted.map(m => {
@@ -880,10 +1076,14 @@ function renderMarketsCard(markets, models) {
       ? formatBucket(m.bucket)
       : '<span class="na">unrecognised format</span>';
 
+    const sigmaStr = m.sigma != null
+      ? `<span class="sigma-info">σ=${m.sigma.toFixed(1)}°C · ${m.daysAhead}d ahead</span>`
+      : '';
+
     return `<tr>
       <td class="question-cell">
         <a href="${esc(m.url)}" target="_blank" rel="noopener">${esc(m.question)}</a>
-        <div class="bucket-parsed">${bucketStr}</div>
+        <div class="bucket-parsed">${bucketStr} ${sigmaStr}</div>
         ${perModelHtml ? `<div class="per-model-row">${perModelHtml}</div>` : ''}
       </td>
       <td class="center">${fPct(m.yesPrice)}</td>
@@ -981,7 +1181,11 @@ function renderResults(data) {
   const el = document.getElementById('results');
   el.innerHTML = [
     renderLocationCard(data.location, data.dateStr),
-    renderForecastCard(data.models, data.consensusC, data.consensusF),
+    renderForecastCard(
+      data.models, data.consensusC, data.consensusF,
+      data.additionalSources || [], data.sourceErrors || [],
+      data.daysAhead, data.sigma
+    ),
     renderEnsembleCard(data.ensemble),
     renderMarketsCard(data.markets, data.models),
   ].join('');
@@ -1016,7 +1220,6 @@ function setLoading(form, loading) {
 
 function initDateInput() {
   const input = document.getElementById('date');
-  // Use LOCAL date, not UTC, to avoid timezone issues
   const fmt = d => `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
   const now = new Date();
   const yesterday = new Date(now); yesterday.setDate(yesterday.getDate() - 1);
@@ -1034,6 +1237,26 @@ function initTabs() {
       btn.classList.add('active');
       document.getElementById('tab-' + btn.dataset.tab).classList.add('active');
     });
+  });
+}
+
+function initApiKeys() {
+  const tomorrowInput = document.getElementById('key-tomorrow');
+  const meteosourceInput = document.getElementById('key-meteosource');
+  const saveBtn = document.getElementById('btn-save-keys');
+
+  // Restore saved keys (show masked placeholder if key exists)
+  if (getApiKey('tomorrowio')) tomorrowInput.placeholder = '••••••••••••••••••••••••••••••••';
+  if (getApiKey('meteosource')) meteosourceInput.placeholder = '••••••••••••••••••••••••••••••••';
+
+  saveBtn.addEventListener('click', () => {
+    const tKey = tomorrowInput.value.trim();
+    const mKey = meteosourceInput.value.trim();
+    if (tKey) { setApiKey('tomorrowio', tKey); tomorrowInput.value = ''; tomorrowInput.placeholder = '••••••••••••••••••••••••••••••••'; }
+    if (mKey) { setApiKey('meteosource', mKey); meteosourceInput.value = ''; meteosourceInput.placeholder = '••••••••••••••••••••••••••••••••'; }
+    if (!tKey && !mKey) return;
+    saveBtn.textContent = 'Saved ✓';
+    setTimeout(() => { saveBtn.textContent = 'Save Keys'; }, 2000);
   });
 }
 
@@ -1083,6 +1306,7 @@ function initForms() {
 document.addEventListener('DOMContentLoaded', () => {
   initTabs();
   initDateInput();
+  initApiKeys();
   initForms();
 });
 
@@ -1094,6 +1318,9 @@ if (typeof window !== 'undefined') {
     parseCityFromQuestion,
     parseCityFromSlug,
     bucketProbability,
+    bucketProbabilityWithSigma,
+    daysAheadFromDate,
+    sigmaForDays,
     erf,
     slugFromPolymarketUrl,
   };
