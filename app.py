@@ -459,7 +459,7 @@ def fetch_current_obs(lat: float, lon: float) -> dict:
 
 # ── Forecast ──────────────────────────────────────────────────────────────────
 
-@st.cache_data(ttl=1800)   # 30-min cache
+@st.cache_data(ttl=21600)   # 6h cache — Open-Meteo forecast cycles update every 6h
 def fetch_forecast(lat: float, lon: float, date_str: str, model_id: str) -> dict:
     params = {
         "latitude": lat,
@@ -496,7 +496,7 @@ def fetch_forecast(lat: float, lon: float, date_str: str, model_id: str) -> dict
 
 # ── Ensemble (probabilistic) forecast ─────────────────────────────────────────
 
-@st.cache_data(ttl=1800)
+@st.cache_data(ttl=21600)   # 6h cache — ensemble cycles update every 6h
 def fetch_ensemble_members(lat: float, lon: float, date_str: str, model_id: str) -> list:
     """
     Returns list of daily-max temperatures (°C), one per ensemble member,
@@ -647,7 +647,7 @@ def get_api_key(env_var: str) -> str:
     return os.environ.get(env_var, "")
 
 
-@st.cache_data(ttl=1800)
+@st.cache_data(ttl=21600)   # 6h cache — NWS forecast cycles
 def fetch_nws_forecast(lat: float, lon: float, date_str: str) -> dict:
     """Fetch daytime high from NWS api.weather.gov (US only, 7-day window)."""
     r1 = requests.get(
@@ -683,7 +683,7 @@ def fetch_nws_forecast(lat: float, lon: float, date_str: str) -> dict:
     raise ValueError(f"NWS: no daytime period found for {date_str} (max 7-day window)")
 
 
-@st.cache_data(ttl=1800)
+@st.cache_data(ttl=21600)   # 6h cache — daily forecast value
 def fetch_tomorrowio(lat: float, lon: float, date_str: str, api_key: str) -> dict:
     """Fetch daily max temp from Tomorrow.io (global, requires API key)."""
     if not api_key:
@@ -718,7 +718,7 @@ def fetch_tomorrowio(lat: float, lon: float, date_str: str, api_key: str) -> dic
     raise ValueError(f"Tomorrow.io: no data for {date_str} (free tier: 5-day window)")
 
 
-@st.cache_data(ttl=1800)
+@st.cache_data(ttl=21600)   # 6h cache — daily forecast value
 def fetch_meteosource(lat: float, lon: float, date_str: str, api_key: str) -> dict:
     """Fetch daily max temp from Meteosource (global, requires API key)."""
     if not api_key:
@@ -1096,16 +1096,180 @@ def parse_markets(events_or_markets: list, city_filter: str | None = None) -> li
     return results
 
 
+# ── Source health diagnostics ─────────────────────────────────────────────────
+
+def friendly_error(err: str) -> str:
+    """Convert raw API errors into user-friendly messages."""
+    if not err:
+        return ""
+    e = str(err).lower()
+    if "429" in e or "rate limit" in e or "too many requests" in e or "daily api request" in e:
+        if "open-meteo" in e or "ecmwf_ifs" in e or "gfs_" in e or "ensemble" in e:
+            return "🔁 Open-Meteo daily rate limit reached for this IP (resets at 00:00 UTC)"
+        if "tomorrow" in e or "tomorrow.io" in e:
+            return "🔁 Tomorrow.io rate limit (free tier: 25/hr, 500/day) — wait an hour"
+        if "meteosource" in e:
+            return "🔁 Meteosource rate limit (free tier: 400/day) — try tomorrow"
+        return "🔁 Rate limited — try again later"
+    if "timed out" in e or "timeout" in e:
+        return "⏱ Timeout — API was slow or unreachable"
+    if "outside us" in e:
+        return "📍 NWS covers US only"
+    if "7-day window" in e:
+        return "📅 NWS only forecasts up to 7 days ahead"
+    if "outside forecast window" in e or "not in ensemble window" in e:
+        return "📅 Date outside the model's forecast window"
+    # Generic fallback: keep first line, drop technical details
+    return str(err).split("\n")[0][:160]
+
+
+def compute_source_health(model_results: list, additional_sources: list,
+                          ensemble_by_model: dict) -> dict:
+    """
+    Inventory every forecast source: who's alive, who's dead, and why.
+    Returns a dict with active/failed counts + per-source status.
+    """
+    sources = []  # list of (label, kind, ok, weight, error, members)
+
+    # Deterministic models (ECMWF IFS, GFS-GraphCast, GFS)
+    for r in (model_results or []):
+        ok = r.get("max_c") is not None and not r.get("error")
+        sources.append({
+            "label":   r.get("label", "?"),
+            "kind":    "deterministic",
+            "ok":      ok,
+            "weight":  _model_weight(r.get("label", "")),
+            "error":   friendly_error(r.get("error")),
+            "members": None,
+        })
+
+    # Additional sources (NWS, Tomorrow.io, Meteosource)
+    for s in (additional_sources or []):
+        ok = s.get("max_c") is not None and not s.get("error")
+        sources.append({
+            "label":   s.get("label", "?"),
+            "kind":    "additional",
+            "ok":      ok,
+            "weight":  _model_weight(s.get("label", "")),
+            "error":   friendly_error(s.get("error")),
+            "members": None,
+        })
+
+    # Ensemble groups (ECMWF ENS, GEFS, ICON-EPS, GEPS)
+    if ensemble_by_model:
+        for label, info in ensemble_by_model.items():
+            n = len(info.get("members") or [])
+            ok = n > 0
+            sources.append({
+                "label":   label,
+                "kind":    "ensemble",
+                "ok":      ok,
+                "weight":  _model_weight(label),
+                "error":   friendly_error(info.get("error")),
+                "members": n,
+            })
+
+    active = [s for s in sources if s["ok"]]
+    failed = [s for s in sources if not s["ok"]]
+    total  = len(sources)
+
+    # Expected weight share alive (weighted view: how much "decision weight" survived)
+    total_weight  = sum(s["weight"] for s in sources) or 1.0
+    active_weight = sum(s["weight"] for s in active)
+    weight_share  = active_weight / total_weight
+
+    # Confidence tier from source coverage
+    if total == 0:
+        tier = "none"
+    elif weight_share >= 0.8 and len(active) >= max(4, int(total * 0.7)):
+        tier = "full"
+    elif weight_share >= 0.5 and len(active) >= 3:
+        tier = "reduced"
+    elif len(active) >= 1:
+        tier = "insufficient"
+    else:
+        tier = "none"
+
+    # Flag the heavyweights
+    critical_missing = [s["label"] for s in failed if s["weight"] >= 1.2]
+
+    return {
+        "sources":          sources,
+        "active":           active,
+        "failed":           failed,
+        "n_total":          total,
+        "n_active":         len(active),
+        "weight_share":     weight_share,
+        "tier":             tier,            # "full" | "reduced" | "insufficient" | "none"
+        "critical_missing": critical_missing,
+    }
+
+
+def render_source_health_banner(health: dict):
+    """Prominent banner at the top of analysis showing what's actually working."""
+    tier      = health["tier"]
+    n_active  = health["n_active"]
+    n_total   = health["n_total"]
+    crit_miss = health["critical_missing"]
+    weight_pp = health["weight_share"] * 100
+
+    if tier == "full":
+        st.success(
+            f"🛰 **Source health: {n_active}/{n_total} active** "
+            f"({weight_pp:.0f}% of decision weight available) — recommendation is based on full data."
+        )
+    elif tier == "reduced":
+        crit_str = f"  ·  ⚠️ Missing high-weight sources: **{', '.join(crit_miss)}**" if crit_miss else ""
+        st.warning(
+            f"🛰 **Source health: {n_active}/{n_total} active** "
+            f"({weight_pp:.0f}% of decision weight available) — **REDUCED CONFIDENCE**{crit_str}.  \n"
+            f"Recommendations below are downgraded. Re-run in 1–2 hours for fuller data."
+        )
+    elif tier == "insufficient":
+        st.error(
+            f"🛰 **Source health: only {n_active}/{n_total} active** "
+            f"({weight_pp:.0f}% of decision weight) — **INSUFFICIENT DATA**.  \n"
+            f"No trading recommendation will be issued. Most likely cause: Open-Meteo daily rate limit "
+            f"(shared IP on Streamlit Cloud). Try again at 00:00 UTC or 1–2 hours from now."
+        )
+    else:
+        st.error("🛰 **No forecast sources responded.** Cannot analyze this market.")
+
+    # Detailed per-source table
+    with st.expander(f"Per-source status ({n_active}/{n_total} active) — click for details"):
+        rows = []
+        for s in health["sources"]:
+            stars  = "★★★" if s["weight"] >= 1.2 else "★★" if s["weight"] >= 1.1 else "★"
+            kind   = {"deterministic": "🛰 Det.", "additional": "🛰 Add.",
+                      "ensemble": "🧮 Ens."}.get(s["kind"], "?")
+            status = "✅ active" if s["ok"] else "❌ failed"
+            mem    = f"{s['members']} members" if s["members"] is not None else "—"
+            rows.append({
+                "Source":      s["label"],
+                "Type":        kind,
+                "Status":      status,
+                "Reliability": stars,
+                "Members":     mem,
+                "Why failed":  s["error"] or "—",
+            })
+        st.dataframe(pd.DataFrame(rows).set_index("Source"), use_container_width=True)
+
+
 def enrich_markets(markets: list, model_results: list,
                    ensemble_members: list | None = None,
                    ensemble_by_model: dict | None = None,
                    additional_sources: list | None = None,
-                   sigma: float = SIGMA) -> list:
+                   sigma: float = SIGMA,
+                   health: dict | None = None) -> list:
     """
     Compute probability for each Polymarket bucket.
     Priority:  empirical ensemble probability  >  normal approx around deterministic.
     Additional sources (NWS, Tomorrow.io, Meteosource) augment deterministic pool.
     """
+    # Compute health if not provided
+    if health is None:
+        health = compute_source_health(model_results, additional_sources, ensemble_by_model)
+
     valid_det = [r for r in model_results if r.get("max_c") is not None]
     if additional_sources:
         valid_det = valid_det + [s for s in additional_sources if s.get("max_c") is not None and not s.get("error")]
@@ -1182,6 +1346,7 @@ def enrich_markets(markets: list, model_results: list,
             "edge":       (model_prob - m["yes_price"]) if model_prob is not None else None,
             "per_model":  per_model,
             "method":     method,
+            "_health":    health,
         })
     return enriched
 
@@ -1710,6 +1875,9 @@ def render_detailed_recommendation(enriched_markets: list, days_ahead: int, sigm
         question  = m["question"]
         bucket    = m.get("bucket")
         edge_pp   = edge * 100
+        health    = m.get("_health") or {}
+        h_tier    = health.get("tier", "full")
+        crit_miss = health.get("critical_missing", [])
 
         # ── Verdict ─────────────────────────────────────────────────────────
         if   edge_pp >= 15:  verdict = "🟢 STRONG BUY YES"
@@ -1719,6 +1887,28 @@ def render_detailed_recommendation(enriched_markets: list, days_ahead: int, sigm
         elif edge_pp <= -8:  verdict = "🟠 BUY NO"
         elif edge_pp <= -4:  verdict = "🟠 Slight lean NO"
         else:                verdict = "⚪ No clear edge"
+
+        # If data is insufficient, refuse to recommend — show data status only
+        if h_tier == "insufficient" or h_tier == "none":
+            with st.container(border=True):
+                st.markdown(f"### ⚠️ INSUFFICIENT DATA — no recommendation issued")
+                st.markdown(f"**{question}**")
+                st.warning(
+                    f"Only **{health.get('n_active', 0)}/{health.get('n_total', 0)}** forecast sources "
+                    f"are responding right now ({health.get('weight_share', 0)*100:.0f}% of decision weight). "
+                    f"The combined probability would be unreliable, so no buy/sell verdict is shown. "
+                    f"Re-run in 1–2 hours or after 00:00 UTC (when Open-Meteo's daily limit resets)."
+                )
+                if m.get("url"):
+                    st.link_button("Open on Polymarket ↗", m["url"])
+            continue
+
+        # Downgrade strong verdicts when data is partial
+        if h_tier == "reduced":
+            if "STRONG BUY YES" in verdict: verdict = "🟡 BUY YES (REDUCED CONFIDENCE)"
+            elif "STRONG BUY NO" in verdict: verdict = "🟠 BUY NO (REDUCED CONFIDENCE)"
+            elif "BUY YES" in verdict:       verdict = "💛 Slight lean YES (REDUCED CONFIDENCE)"
+            elif "BUY NO" in verdict:        verdict = "🟠 Slight lean NO (REDUCED CONFIDENCE)"
 
         # ── Model agreement ──────────────────────────────────────────────────
         valid_pm = [pm for pm in per_model if isinstance(pm, dict) and pm.get("forecast_c") is not None]
@@ -1954,6 +2144,16 @@ def render_detailed_recommendation(enriched_markets: list, days_ahead: int, sigm
             else:
                 risks.append("⚠️ No resolution station detected — Polymarket may use a different point than our forecast")
 
+            # Data quality (always shown)
+            if h_tier == "full":
+                risks.append(f"✅ Full source coverage ({health.get('n_active', 0)}/{health.get('n_total', 0)} sources active)")
+            elif h_tier == "reduced":
+                cm = f" — missing {', '.join(crit_miss)}" if crit_miss else ""
+                risks.append(
+                    f"⚠️ Partial source coverage: only {health.get('n_active', 0)}/{health.get('n_total', 0)} "
+                    f"sources active{cm} — verdict downgraded"
+                )
+
             for r in risks:
                 st.markdown(f"- {r}")
 
@@ -2140,7 +2340,13 @@ def run_analysis(city_input: str, date_str: str, markets_override=None):
 
     dist_members = pooled if len(pooled) >= 10 else (prob_samples or [])
     valid_extra  = [s for s in additional_sources if s.get("max_c") is not None and not s.get("error")]
-    enriched = enrich_markets(markets, model_results, dist_members, by_model, valid_extra, sigma)
+
+    # Compute source health BEFORE enrich/render so we can show a banner up front
+    health = compute_source_health(model_results, additional_sources, by_model)
+    render_source_health_banner(health)
+
+    enriched = enrich_markets(markets, model_results, dist_members, by_model,
+                              valid_extra, sigma, health=health)
     render_markets(enriched)
     render_detailed_recommendation(enriched, days_ahead, sigma)
     return model_results
